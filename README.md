@@ -146,7 +146,9 @@ Suspend/resume failures were reproduced 7 out of 7 times with `rtcwake`-timed su
 
 ### Changelog
 
-- **v1.6.2 (2026-10-14)**: support for the hid-oxp driver in kernel 7.2.7 (SteamOS 20261013.1000), which adds native ONEXPLAYER 3 lighting and maps the back paddles to F15/F16 by default. The paddle check accepts any two different F13-F24 keys and no longer overrides the driver default. README: lighting section updated.
+Releases are named by date (`YYYYMMDD`) from 20261014 on; earlier ones used version numbers.
+
+- **20261014**: support for the hid-oxp driver in kernel 7.2.7 (SteamOS 20261013.1000), which adds native ONEXPLAYER 3 lighting and maps the back paddles to F15/F16 by default. The paddle check accepts any two different F13-F24 keys and no longer overrides the driver default. README: lighting section updated.
 - **v1.6.1 (2026-09-25)**: the Wi-Fi/Bluetooth step uses the cached firmware package when there is no network, so Wi-Fi comes back after a SteamOS update without USB tethering.
 - **v1.6.0 (2026-09-25)**: TDP sync (step 8). The GPU obeys the MSR package PL1, which the firmware leaves at 25 W while TDP tools only set the MMIO PL1, so the GPU was throttled even with a 50 W TDP; a small root service now keeps the MSR PL1 equal to the MMIO PL1. README note on chargers for high TDPs.
 - **v1.5.1 (2026-09-25)**: the release is a single archive, `oxp3-fix.tar.gz`, that extracts to `~/oxp3-fix`; the gyro step uses the patched InputPlumber from it.

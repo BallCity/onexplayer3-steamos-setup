@@ -1,13 +1,13 @@
 #!/bin/bash
 # oxp3-steamos-fixes - ONEXPLAYER 3 (Intel Panther Lake) SteamOS fix pack
-# Version: v1.6.2 (2026-10-14)     License: MIT (see LICENSE)     Author: HANA & Claude
+# Version: 20261014     License: MIT (see LICENSE)     Author: HANA & Claude
 # Tested on: SteamOS 3.10 main build 20260827.1000, kernel 7.2.0-valve1-1-neptune-72, OXP3 BIOS 5.09,
 #            panel Samsung SDC AMS881KB01-0, SSD Predator GM7 1TB (Biwin/Maxio 1dee:1602)
 # v1.1.0: gamescope HDR lua now also registers real 30-144Hz dynamic_modegen (this panel has genuine
 #         continuous VRR; the v1.0.1 lua declared dynamic_refresh_rates but never shipped the
 #         matching dynamic_modegen function, so no extra Hz options ever actually appeared in the
 #         Steam Performance panel's per-game refresh-rate selector).
-# v1.6.2: kernel 7.2.7 (SteamOS 20261013.1000) ships a hid-oxp with native ONEXPLAYER 3 support (three RGB LED zones,
+# 20261014: kernel 7.2.7 (SteamOS 20261013.1000) ships a hid-oxp with native ONEXPLAYER 3 support (three RGB LED zones,
 #         suspend/resume handling) whose default paddle keys are KEY_F15/KEY_F16 instead of KEY_F16/KEY_F17. The paddles
 #         reach InputPlumber through the MCU vendor frames either way, so any two distinct F13-F24 keys now count as correct
 #         and apply no longer overrides the driver's default.
@@ -46,7 +46,7 @@
 #         the hid-oxp sysfs (driver pages 1-2 only, never raw hidraw); new --mcu-restore (DANGEROUS, explicit, confirmed)
 #         rewrites MCU button-table page 3 (Home 0x24 + factory-default 0x21/0x25-0x2B) to recover a Home/Xbox
 #         key that went silent after a foreign tool overwrote the MCU table.
-OXP3_FIXES_VERSION="v1.6.2 (2026-10-14)"
+OXP3_FIXES_VERSION="20261014"
 TESTED_STEAMOS_BUILD="20260827.1000"
 TESTED_KERNEL_PREFIX="7.2.0-valve1"
 # ============================================================================
@@ -133,7 +133,7 @@ GRUB_IMU_FILE=/etc/default/grub.d/oxp3-imu.cfg
 GYRO_BIOS="5.09"                                             # the ACPI override is a patched copy of this BIOS's SSDT26
 GYRO_IP_SERIES="0.78"                                        # the patched build is InputPlumber 0.78.0
 GYRO_BIN_SHA256="1107d95c34863c7865cac64183673135098d77265a32763c22fc7efbc1893aa3"
-GYRO_PKG_URL="https://github.com/HHHHanasak1/onexplayer3-steamos-setup/releases/download/v1.6.2/oxp3-fix.tar.gz"   # release archive holding the binary
+GYRO_PKG_URL="https://github.com/HHHHanasak1/onexplayer3-steamos-setup/releases/download/20261014/oxp3-fix.tar.gz"   # release archive holding the binary
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"                  # the extracted release archive, if the script came from it
 ACPI_IMG_SHA256="0e9b716e65978ac7365fda6fddf476a18b352a2d1ed98f4f30c8d3f8558b2113"
 ACPI_IMG_OLD_SHA256="2d1a0a88e4cfe694cd4edc9b0d0a5e28f7f3f5bb9ccdcf7cbf1d5d01a02d42ad"   # earlier build of the same table (long cpio member name)
