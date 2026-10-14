@@ -122,7 +122,7 @@ The fix pack does not touch lighting.
 - **Kernel 7.2.7 and later (SteamOS 20261013.1000 and later):** the hid-oxp driver supports the ONEXPLAYER 3 lights natively. It registers three LEDs, `oxp:rgb:joystick_rings`, `oxp:rgb:guide_button` (the Xbox button) and `oxp:rgb:rear_logo` (the slogan light), each with `brightness` and an RGB `multi_intensity`; the rings also have effects (`effect`, `speed`, `enabled`). The driver restores the lights after suspend.
 - **Older kernels:** the hid-oxp LED interface has no effect on this controller.
 
-For a lighting UI use the [modified fork of HueSync](https://github.com/PPPPatrick0/HueSync/tree/oxp3), a Decky plugin with three independently controlled zones. On kernel 7.2.7 and later it drives the native LEDs above, on older kernels it falls back to writing the controller directly. Its README explains how to install it. It is independent of the fix pack, so the two can be installed in either order.
+For a lighting UI use the [modified fork of HueSync](https://github.com/HHHHanasak1/HueSync/tree/oxp3), a Decky plugin with three independently controlled zones. On kernel 7.2.7 and later it drives the native LEDs above, on older kernels it falls back to writing the controller directly. Its README explains how to install it. It is independent of the fix pack, so the two can be installed in either order.
 
 ### Known issues and limitations
 
