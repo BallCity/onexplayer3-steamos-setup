@@ -117,7 +117,12 @@ Flags: `--yes`, `--force`, `--force-nvme`, `--no-wifi`, `--gyro`, `--no-gyro`.
 
 ### Lighting
 
-The fix pack does not touch lighting: the kernel hid-oxp LED interface has no effect on the ONEXPLAYER 3 controller. For lighting control use the [modified fork of HueSync](https://github.com/PPPPatrick0/HueSync/tree/oxp3), a Decky plugin that adds three independently controlled zones: the joystick rings, the Xbox button light and the slogan light. Its README explains how to install it. It is independent of the fix pack, so the two can be installed in either order.
+The fix pack does not touch lighting.
+
+- **Kernel 7.2.7 and later (SteamOS 20261013.1000 and later):** the hid-oxp driver supports the ONEXPLAYER 3 lights natively. It registers three LEDs, `oxp:rgb:joystick_rings`, `oxp:rgb:guide_button` (the Xbox button) and `oxp:rgb:rear_logo` (the slogan light), each with `brightness` and an RGB `multi_intensity`; the rings also have effects (`effect`, `speed`, `enabled`). The driver restores the lights after suspend.
+- **Older kernels:** the hid-oxp LED interface has no effect on this controller.
+
+For a lighting UI use the [modified fork of HueSync](https://github.com/HHHHanasak1/HueSync/tree/oxp3), a Decky plugin with three independently controlled zones. On kernel 7.2.7 and later it drives the native LEDs above, on older kernels it falls back to writing the controller directly. Its README explains how to install it. It is independent of the fix pack, so the two can be installed in either order.
 
 ### Known issues and limitations
 
@@ -127,13 +132,13 @@ As of 2026-09-24 the stable fixes have been in daily use for about half a month,
 - **High TDP needs a strong charger.** Whenever the charger reports disconnected, the firmware resets the TDP to its battery limits (35 W / 52 W) and a TDP plugin puts its own value back a little later. With a charger that cannot cover the SoC, the screen and charging at the same time, the adapter flaps between connected and disconnected (seen: 13 times in 4 minutes at a 50 W TDP, the battery still discharging at about 34 W while plugged in), so the limit bounces between 35 and 50 W. For TDPs around 50 W use a charger that covers all of it; a 100 W USB PD charger is recommended.
 - **Volume key root cause** is in the embedded controller firmware. A firmware update from the vendor would remove the need for the forwarder.
 - **HDR uses the gamma-2.2 path.** A true PQ path (`xe.enable_dpcd_backlight=1`) has not been tested.
-- **Lighting is not part of this pack**, see the Lighting section above. Never unbind or rebind hid-oxp: it triggers a kernel Oops (`issues/hid_oxp_oops_rebind.txt`).
+- **Lighting is not part of this pack**, see the Lighting section above (native on kernel 7.2.7 and later). Never unbind or rebind hid-oxp: it triggers a kernel Oops (`issues/hid_oxp_oops_rebind.txt`).
 
 Upstream bug drafts are in `issues/`.
 
 ### Tested configuration
 
-SteamOS 3.10 main 20260827.1000, kernel 7.2.0-valve1-1-neptune-72 (paddles, Wi-Fi/Bluetooth firmware, battery clamp and gyro verified on 7.2.4-valve1 / SteamOS 20260921.1000), OXP3 BIOS 5.09, panel SDC AMS881KB01-0, SSD Predator GM7 1TB. The script refuses to run on other DMI or OS values (`--force` overrides) and only applies `nvme.noacpi=1` when a GM7 / `1dee:1602` SSD is present (`--force-nvme` overrides). The gyro step additionally requires BIOS 5.09 and InputPlumber 0.78.x (`--force` overrides).
+SteamOS 3.10 main 20260827.1000, kernel 7.2.0-valve1-1-neptune-72 (paddles, Wi-Fi/Bluetooth firmware, battery clamp and gyro verified on 7.2.4-valve1 / SteamOS 20260921.1000; all fixes re-verified on 7.2.7-valve2 / SteamOS 20261013.1000), OXP3 BIOS 5.09, panel SDC AMS881KB01-0, SSD Predator GM7 1TB. The script refuses to run on other DMI or OS values (`--force` overrides) and only applies `nvme.noacpi=1` when a GM7 / `1dee:1602` SSD is present (`--force-nvme` overrides). The gyro step additionally requires BIOS 5.09 and InputPlumber 0.78.x (`--force` overrides).
 
 ### How it was found
 
@@ -141,6 +146,9 @@ Suspend/resume failures were reproduced 7 out of 7 times with `rtcwake`-timed su
 
 ### Changelog
 
+Releases are named by date (`YYYYMMDD`) from 20261014 on; earlier ones used version numbers.
+
+- **20261014**: support for the hid-oxp driver in kernel 7.2.7 (SteamOS 20261013.1000), which adds native ONEXPLAYER 3 lighting and maps the back paddles to F15/F16 by default. The paddle check accepts any two different F13-F24 keys and no longer overrides the driver default. README: lighting section updated.
 - **v1.6.1 (2026-09-25)**: the Wi-Fi/Bluetooth step uses the cached firmware package when there is no network, so Wi-Fi comes back after a SteamOS update without USB tethering.
 - **v1.6.0 (2026-09-25)**: TDP sync (step 8). The GPU obeys the MSR package PL1, which the firmware leaves at 25 W while TDP tools only set the MMIO PL1, so the GPU was throttled even with a 50 W TDP; a small root service now keeps the MSR PL1 equal to the MMIO PL1. README note on chargers for high TDPs.
 - **v1.5.1 (2026-09-25)**: the release is a single archive, `oxp3-fix.tar.gz`, that extracts to `~/oxp3-fix`; the gyro step uses the patched InputPlumber from it.
