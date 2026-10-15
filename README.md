@@ -133,6 +133,11 @@ As of 2026-09-24 the stable fixes have been in daily use for about half a month,
 - **High TDP needs a strong charger.** Whenever the charger reports disconnected, the firmware resets the TDP to its battery limits (35 W / 52 W) and a TDP plugin puts its own value back a little later. With a charger that cannot cover the SoC, the screen and charging at the same time, the adapter flaps between connected and disconnected (seen: 13 times in 4 minutes at a 50 W TDP, the battery still discharging at about 34 W while plugged in), so the limit bounces between 35 and 50 W. For TDPs around 50 W use a charger that covers all of it; a 100 W USB PD charger is recommended.
 - **Volume key root cause** is in the embedded controller firmware. A firmware update from the vendor would remove the need for the forwarder.
 - **Split-lock detection is off.** With `split_lock_detect=off` the kernel no longer reports a program that uses split locks (a bus lock that briefly stalls memory access for every core). That only matters for spotting such programs; SteamOS was not slowing them down anyway (`kernel.split_lock_mitigate=0`). `--revert` turns detection back on after a reboot.
+- **The performance overlay shows 0 W for the CPU.** The overlay (MangoHud) reads the CPU energy counter from `/sys/class/powercap/intel-rapl:0/energy_uj`, which the kernel makes readable by root only since the PLATYPUS power side channel ([CVE-2020-8694](https://nvd.nist.gov/vuln/detail/CVE-2020-8694)), so the overlay runs unprivileged and gets nothing. The fix pack leaves that protection in place. If you want the reading and accept that any local program can then sample the energy counters, a udev rule makes them world-readable from the next boot (`sudo rm` the file and reboot to undo):
+  ```bash
+  echo 'SUBSYSTEM=="powercap", ACTION=="add", RUN+="/usr/bin/chmod 0444 /sys%p/energy_uj"' | sudo tee /etc/udev/rules.d/99-oxp3-rapl-read.rules
+  ```
+  The rule lives in `/etc`, which a SteamOS update resets, so add it again after an update.
 - **HDR uses the gamma-2.2 path.** A true PQ path (`xe.enable_dpcd_backlight=1`) has not been tested.
 - **Lighting is not part of this pack**, see the Lighting section above (native on kernel 7.2.7 and later). Never unbind or rebind hid-oxp: it triggers a kernel Oops (`issues/hid_oxp_oops_rebind.txt`).
 
