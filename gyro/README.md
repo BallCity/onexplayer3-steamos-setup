@@ -10,6 +10,10 @@ Opt-in step 7 of the fix pack (`./oxp3-apply-fixes.sh --gyro`). This directory h
 2. **InputPlumber needs to understand the sensor.** A [patched InputPlumber 0.78.0](inputplumber-0.78.0-oxp3-gyro.patch) adds a mount matrix and bias options to the IIO source, orders the gyro fields the way Steam's Steam Deck HID driver reads them, and feeds them to the virtual Steam Deck controller (`deck-uhid`) at Steam's fixed 4 ms report interval. The yaml entry for the IMU gets the matching keys (the fix pack writes them only when gyro is enabled).
 3. **Drift handling.** The new `gyro_steer` module passes the yaw rate through a slow high-pass: it mirrors the angle Steam integrates and folds a small return rate into the stream, so a constant bias becomes a small bounded offset instead of a runaway drift. Optional response shaping (`curve`, `gain`, `range`, off by default) can give small tilts more reach than large ones. It can also learn the bias while the device rests, or map the angle to the left stick instead (`mode=stick`).
 
+### BIOS 5.12
+
+On BIOS 5.12 (09/07/2026, EC 0.13) the firmware's `SSDT26` is the same table as on 5.09: same length (0x517C) and OEM revision (0x1000), and its decompiled source differs from [`SSDT26-oxp3-imu.dsl`](SSDT26-oxp3-imu.dsl) only by the override's own edits (OEM revision 0x1001, the `BMI0260` ids and the mount-matrix `_DSD`). At boot `bmi160_i2c` now reads the chip id and reports `Chip id not found: 27`, which is 0x27, the BMI260's id; on 5.09 the read itself failed with -121. So the 5.09 override probably fits 5.12 as well, but that has not been tried yet: the script still skips the gyro step on 5.12 unless you pass `--force`.
+
 ## Files the fix pack installs
 
 | File | Purpose |
