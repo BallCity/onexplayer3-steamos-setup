@@ -106,6 +106,8 @@ else
 fi
 [ -n "$USER_HOME" ] || USER_HOME="$HOME"
 GRUB_D_FILE=/etc/default/grub.d/oxp3-nvme.cfg
+SPLITLOCK_FILE=/etc/default/grub.d/oxp3-splitlock.cfg
+SLS_TRACE_DIR=/var/lib/steamos-log-submitter/pending/trace
 MODPROBE_FILE=/etc/modprobe.d/xe-oxp3.conf
 LUA_DIR="$USER_HOME/.config/gamescope/scripts"
 LUA_HDR="$LUA_DIR/98-oxp3-oled-hdr.lua"
@@ -142,6 +144,11 @@ ACPI_IMG_OLD_SHA256="2d1a0a88e4cfe694cd4edc9b0d0a5e28f7f3f5bb9ccdcf7cbf1d5d01a02
 GRUB_D_CONTENT=$(cat <<'EOT'
 # nvme.noacpi=1: Predator GM7 fails to resume from s2idle via ACPI simple-suspend. Revert: rm this file, run update-grub
 GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} nvme.noacpi=1"
+EOT
+)
+
+SPLITLOCK_CONTENT=$(cat <<'EOT'
+GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} split_lock_detect=off"
 EOT
 )
 
@@ -856,6 +863,11 @@ nvme_bug_present() {
     return 1
 }
 have_evdev() { python3 -c 'import evdev' >/dev/null 2>&1; }
+have_split_lock_detect() { grep -qw split_lock_detect /proc/cpuinfo 2>/dev/null; }
+sls_split_lock_traces() {
+    sudo -n test -d "$SLS_TRACE_DIR" 2>/dev/null || { echo '?'; return 0; }
+    sudo -n grep -rlZ '"type": "split_lock"' "$SLS_TRACE_DIR" 2>/dev/null | tr -cd '\0' | wc -c || true
+}
 have_ip() { command -v inputplumber >/dev/null 2>&1 && [ -f /usr/lib/systemd/system/inputplumber.service ]; }
 # the hid-oxp-bound MCU config interface (iface 2, has the gamepad_mode attribute)
 oxp_hid_dev() { local d; for d in /sys/bus/hid/drivers/hid-oxp/0003:1A86:FE00.*; do [ -f "$d/gamepad_mode" ] && { echo "$d"; return 0; }; done; return 1; }
@@ -927,6 +939,16 @@ else
     say "  kernel param nvme.noacpi=1 : NOT active (not in /proc/cmdline)"; CMD_OK=0
 fi
 if [ -f "$GRUB_D_FILE" ]; then say "  $GRUB_D_FILE : present"; else say "  $GRUB_D_FILE : missing"; fi
+SL_OK=0; SL_TRACES='?'
+if have_split_lock_detect; then
+    if grep -qw 'split_lock_detect=off' /proc/cmdline; then
+        say "  kernel param split_lock_detect=off : active (in /proc/cmdline)"; SL_OK=1
+    else
+        say "  kernel param split_lock_detect=off : NOT active (not in /proc/cmdline)"
+    fi
+    SL_TRACES="$(sls_split_lock_traces)"
+    say "  split-lock reports queued by steamos-log-submitter : $SL_TRACES   ('?' = needs sudo to read)"
+fi
 XE_DSB="$(cat /sys/module/xe/parameters/enable_dsb 2>/dev/null || sudo -n cat /sys/module/xe/parameters/enable_dsb 2>/dev/null || echo '?')"
 say "  xe enable_dsb (running) : $XE_DSB   expected N or 0 ('?' = needs sudo to read)"
 if [ -f "$MODPROBE_FILE" ]; then say "  $MODPROBE_FILE : present"; else say "  $MODPROBE_FILE : missing"; fi
@@ -988,6 +1010,11 @@ if [ "$MODE" = "--check" ]; then
         say "  [diff] Wi-Fi/Bluetooth firmware missing (apply extracts it from linux-firmware-intel)"; ok=0
     fi
     same_content "$GRUB_D_FILE" "$GRUB_D_CONTENT" || { say "  [diff] grub.d file missing or differs"; ok=0; }
+    if have_split_lock_detect; then
+        same_content "$SPLITLOCK_FILE" "$SPLITLOCK_CONTENT" || { say "  [diff] split-lock grub.d file missing or differs"; ok=0; }
+        [ "$SL_OK" = 1 ] || { say "  [diff] kernel not running with split_lock_detect=off"; ok=0; }
+        case "$SL_TRACES" in 0|'?') ;; *) say "  [diff] $SL_TRACES split-lock reports queued by steamos-log-submitter (apply removes them)"; ok=0 ;; esac
+    fi
     same_content "$MODPROBE_FILE" "$MODPROBE_CONTENT" || { say "  [diff] modprobe file missing or differs"; ok=0; }
     same_content "$LUA_HDR" "$LUA_HDR_CONTENT" || { say "  [diff] HDR lua missing or differs"; ok=0; }
     if [ -f "$LUA_NOHDR" ]; then say "  [diff] old nohdr lua still present"; ok=0; fi
@@ -1074,6 +1101,7 @@ if [ "$MODE" = "--revert" ]; then
     hdr "Reverting all fixes"
     sudo -v
     if [ -f "$GRUB_D_FILE" ]; then sudo rm -f "$GRUB_D_FILE"; say "  removed $GRUB_D_FILE"; sudo update-grub; NEED_REBOOT=1; fi
+    if [ -f "$SPLITLOCK_FILE" ]; then sudo rm -f "$SPLITLOCK_FILE"; say "  removed $SPLITLOCK_FILE"; sudo update-grub; NEED_REBOOT=1; fi
     if [ -f "$MODPROBE_FILE" ]; then sudo rm -f "$MODPROBE_FILE"; say "  removed $MODPROBE_FILE"; NEED_REBOOT=1; fi
     if gyro_installed; then remove_gyro; fi
     rm -f "$GYRO_ON_FILE" "$GYRO_OFF_FILE"
@@ -1118,6 +1146,7 @@ else
 fi
 say "   1) $GRUB_D_FILE (nvme.noacpi=1) + update-grub   $(nvme_bug_present && echo "[SSD matches]" || echo "[SKIPPED: not the affected SSD; use --force-nvme]")"
 say "   2) $MODPROBE_FILE (xe enable_dsb=0)"
+say "  10) $SPLITLOCK_FILE (split_lock_detect=off) + update-grub, and remove the split-lock reports steamos-log-submitter queued   $(have_split_lock_detect && echo "[CPU has split-lock detection]" || echo "[SKIPPED: the CPU has no split-lock detection]")"
 say "   3) $LUA_HDR (gamescope HDR lua) and remove 99-oxp3-nohdr.lua"
 say "   4) $VOLKEY_PY + $VOLKEY_UNIT (volume-key fix)   $(have_evdev && echo "[python3-evdev OK]" || echo "[SKIPPED: python3 evdev missing]")"
 say "   5) $IP_YAML + $IP_CAPMAP + enable inputplumber   $(have_ip && echo "[inputplumber OK]" || echo "[SKIPPED: inputplumber missing]")"
@@ -1262,6 +1291,38 @@ else
     say "  [error] nvme.noacpi=1 NOT found in grub.cfg, check manually"
 fi
 if nvme_bug_present; then [ "$CMD_OK" = 1 ] || NEED_REBOOT=1; fi
+
+if ! have_split_lock_detect; then
+    say "  [skip] the CPU has no split-lock detection, not applying split_lock_detect=off"
+else
+if same_content "$SPLITLOCK_FILE" "$SPLITLOCK_CONTENT"; then
+    say "  [skip] $SPLITLOCK_FILE unchanged"
+else
+    sudo mkdir -p "$(dirname "$SPLITLOCK_FILE")"
+    printf '%s\n' "$SPLITLOCK_CONTENT" | sudo tee "$SPLITLOCK_FILE" >/dev/null
+    say "  [write] $SPLITLOCK_FILE"; CHANGED=1
+fi
+if [ "$SL_OK" = 0 ] || ! sudo grep -q 'split_lock_detect=off' "$EFI_GRUB_CFG" 2>/dev/null; then
+    say "  [run] update-grub -> $EFI_GRUB_CFG"
+    sudo update-grub
+    CHANGED=1
+fi
+if sudo grep -q 'split_lock_detect=off' "$EFI_GRUB_CFG" 2>/dev/null; then
+    say "  [verify] $EFI_GRUB_CFG contains split_lock_detect=off OK"
+else
+    say "  [error] split_lock_detect=off NOT found in grub.cfg, check manually"
+fi
+[ "$SL_OK" = 1 ] || NEED_REBOOT=1
+SL_TRACES="$(sls_split_lock_traces)"
+case "$SL_TRACES" in
+    0|'?') ;;
+    *) if sudo grep -rlZ '"type": "split_lock"' "$SLS_TRACE_DIR" 2>/dev/null | sudo xargs -0 -r rm -f; then
+           say "  [remove] $SL_TRACES queued split-lock reports from $SLS_TRACE_DIR"; CHANGED=1
+       else
+           say "  [error] could not remove the queued split-lock reports from $SLS_TRACE_DIR"
+       fi ;;
+esac
+fi
 
 # d. modprobe.d
 if same_content "$MODPROBE_FILE" "$MODPROBE_CONTENT"; then
