@@ -133,6 +133,11 @@ As of 2026-09-24 the stable fixes have been in daily use for about half a month,
 - **High TDP needs a strong charger.** Whenever the charger reports disconnected, the firmware resets the TDP to its battery limits (35 W / 52 W) and a TDP plugin puts its own value back a little later. With a charger that cannot cover the SoC, the screen and charging at the same time, the adapter flaps between connected and disconnected (seen: 13 times in 4 minutes at a 50 W TDP, the battery still discharging at about 34 W while plugged in), so the limit bounces between 35 and 50 W. For TDPs around 50 W use a charger that covers all of it; a 100 W USB PD charger is recommended.
 - **Volume key root cause** is in the embedded controller firmware. A firmware update from the vendor would remove the need for the forwarder.
 - **Split-lock detection is off.** With `split_lock_detect=off` the kernel no longer reports a program that uses split locks (a bus lock that briefly stalls memory access for every core). That only matters for spotting such programs; SteamOS was not slowing them down anyway (`kernel.split_lock_mitigate=0`). `--revert` turns detection back on after a reboot.
+- **The performance overlay shows 0 W for the CPU.** The overlay (MangoHud) reads the CPU energy counter from `/sys/class/powercap/intel-rapl:0/energy_uj`, which the kernel makes readable by root only since the PLATYPUS power side channel ([CVE-2020-8694](https://nvd.nist.gov/vuln/detail/CVE-2020-8694)), so the overlay runs unprivileged and gets nothing. The fix pack leaves that protection in place. If you want the reading and accept that any local program can then sample the energy counters, a udev rule makes them world-readable from the next boot (`sudo rm` the file and reboot to undo):
+  ```bash
+  echo 'SUBSYSTEM=="powercap", ACTION=="add", RUN+="/usr/bin/chmod 0444 /sys%p/energy_uj"' | sudo tee /etc/udev/rules.d/99-oxp3-rapl-read.rules
+  ```
+  The rule lives in `/etc`, which a SteamOS update resets, so add it again after an update.
 - **HDR uses the gamma-2.2 path.** A true PQ path (`xe.enable_dpcd_backlight=1`) has not been tested.
 - **Lighting is not part of this pack**, see the Lighting section above (native on kernel 7.2.7 and later). Never unbind or rebind hid-oxp: it triggers a kernel Oops (`issues/hid_oxp_oops_rebind.txt`).
 
@@ -150,7 +155,7 @@ Suspend/resume failures were reproduced 7 out of 7 times with `rtcwake`-timed su
 
 Releases are named by date (`YYYYMMDD`) from 20261014 on; earlier ones used version numbers.
 
-- **Unreleased**: split-lock flood (step 10). Steam's split locks were reported tens of times a second through steamos-manager, pushing everything else out of the journal and queueing hundreds of thousands of report files for steamos-log-submitter; `split_lock_detect=off` stops the traps, and apply clears the queued split-lock reports.
+- **20261015**: split-lock flood (step 9, contributed in PR #16). Steam's split locks were reported tens of times a second through steamos-manager, pushing everything else out of the journal and queueing hundreds of thousands of report files for steamos-log-submitter; `split_lock_detect=off` stops the traps, and apply clears the queued split-lock reports. Also: README notes on the CPU power reading in the performance overlay (PR #17) and on the gyro override with BIOS 5.12 (PR #18).
 - **20261014**: support for the hid-oxp driver in kernel 7.2.7 (SteamOS 20261013.1000), which adds native ONEXPLAYER 3 lighting and maps the back paddles to F15/F16 by default. The paddle check accepts any two different F13-F24 keys and no longer overrides the driver default. README: lighting section updated.
 - **v1.6.1 (2026-09-25)**: the Wi-Fi/Bluetooth step uses the cached firmware package when there is no network, so Wi-Fi comes back after a SteamOS update without USB tethering.
 - **v1.6.0 (2026-09-25)**: TDP sync (step 8). The GPU obeys the MSR package PL1, which the firmware leaves at 25 W while TDP tools only set the MMIO PL1, so the GPU was throttled even with a 50 W TDP; a small root service now keeps the MSR PL1 equal to the MMIO PL1. README note on chargers for high TDPs.

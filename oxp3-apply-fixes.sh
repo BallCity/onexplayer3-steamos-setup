@@ -1,12 +1,17 @@
 #!/bin/bash
 # oxp3-steamos-fixes - ONEXPLAYER 3 (Intel Panther Lake) SteamOS fix pack
-# Version: 20261014     License: MIT (see LICENSE)     Author: HANA & Claude
+# Version: 20261015     License: MIT (see LICENSE)     Author: HANA & Claude
 # Tested on: SteamOS 3.10 main build 20260827.1000, kernel 7.2.0-valve1-1-neptune-72, OXP3 BIOS 5.09,
 #            panel Samsung SDC AMS881KB01-0, SSD Predator GM7 1TB (Biwin/Maxio 1dee:1602)
 # v1.1.0: gamescope HDR lua now also registers real 30-144Hz dynamic_modegen (this panel has genuine
 #         continuous VRR; the v1.0.1 lua declared dynamic_refresh_rates but never shipped the
 #         matching dynamic_modegen function, so no extra Hz options ever actually appeared in the
 #         Steam Performance panel's per-game refresh-rate selector).
+# 20261015: new step 9, split-lock flood (contributed by kas5852, PR #16). Panther Lake traps user-space split locks and
+#         Steam causes them continuously; steamos-manager logs every one and steamos-log-submitter queues one report file
+#         per hit (seen: 119,091 files / 479 MB on BIOS 5.09, 361,102 on 5.12), which also pushed everything else out of the
+#         50 MB journal. split_lock_detect=off on the kernel command line stops the traps; apply deletes the queued
+#         split-lock reports (only those).
 # 20261014: kernel 7.2.7 (SteamOS 20261013.1000) ships a hid-oxp with native ONEXPLAYER 3 support (three RGB LED zones,
 #         suspend/resume handling) whose default paddle keys are KEY_F15/KEY_F16 instead of KEY_F16/KEY_F17. The paddles
 #         reach InputPlumber through the MCU vendor frames either way, so any two distinct F13-F24 keys now count as correct
@@ -46,7 +51,7 @@
 #         the hid-oxp sysfs (driver pages 1-2 only, never raw hidraw); new --mcu-restore (DANGEROUS, explicit, confirmed)
 #         rewrites MCU button-table page 3 (Home 0x24 + factory-default 0x21/0x25-0x2B) to recover a Home/Xbox
 #         key that went silent after a foreign tool overwrote the MCU table.
-OXP3_FIXES_VERSION="20261014"
+OXP3_FIXES_VERSION="20261015"
 TESTED_STEAMOS_BUILD="20260827.1000"
 TESTED_KERNEL_PREFIX="7.2.0-valve1"
 # ============================================================================
@@ -67,6 +72,7 @@ TESTED_KERNEL_PREFIX="7.2.0-valve1"
 #        overlays corrected capacity / energy_full sysfs values so Steam and the performance overlay stay at <= 100 %
 #     7) [EXPERIMENTAL, opt-in] gyroscope - ACPI override so the kernel sees the BMI260 + patched InputPlumber (Steam Deck gyro)
 #     8) TDP sync service - the MSR package PL1 (obeyed by the GPU) follows the MMIO PL1 that TDP tools set
+#     9) kernel param split_lock_detect=off - stops the split-lock report flood (journal + steamos-log-submitter queue)
 # Usage:
 #   ./oxp3-apply-fixes.sh                apply (asks sudo password, prints the plan and confirms)
 #   ./oxp3-apply-fixes.sh --check        check only, changes nothing, needs no sudo (covers every fix, gyro included when enabled)
@@ -135,7 +141,7 @@ GRUB_IMU_FILE=/etc/default/grub.d/oxp3-imu.cfg
 GYRO_BIOS="5.09"                                             # the ACPI override is a patched copy of this BIOS's SSDT26
 GYRO_IP_SERIES="0.78"                                        # the patched build is InputPlumber 0.78.0
 GYRO_BIN_SHA256="1107d95c34863c7865cac64183673135098d77265a32763c22fc7efbc1893aa3"
-GYRO_PKG_URL="https://github.com/HHHHanasak1/onexplayer3-steamos-setup/releases/download/20261014/oxp3-fix.tar.gz"   # release archive holding the binary
+GYRO_PKG_URL="https://github.com/HHHHanasak1/onexplayer3-steamos-setup/releases/download/20261015/oxp3-fix.tar.gz"   # release archive holding the binary
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"                  # the extracted release archive, if the script came from it
 ACPI_IMG_SHA256="0e9b716e65978ac7365fda6fddf476a18b352a2d1ed98f4f30c8d3f8558b2113"
 ACPI_IMG_OLD_SHA256="2d1a0a88e4cfe694cd4edc9b0d0a5e28f7f3f5bb9ccdcf7cbf1d5d01a02d42ad"   # earlier build of the same table (long cpio member name)
@@ -148,6 +154,9 @@ EOT
 )
 
 SPLITLOCK_CONTENT=$(cat <<'EOT'
+# split_lock_detect=off: Steam's split locks were trapped and reported tens of times a second (journal flood, report files
+# queued by steamos-log-submitter). SteamOS does not slow split locks down anyway (kernel.split_lock_mitigate=0).
+# Revert: rm this file, run update-grub, reboot
 GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} split_lock_detect=off"
 EOT
 )
@@ -864,9 +873,10 @@ nvme_bug_present() {
 }
 have_evdev() { python3 -c 'import evdev' >/dev/null 2>&1; }
 have_split_lock_detect() { grep -qw split_lock_detect /proc/cpuinfo 2>/dev/null; }
-sls_split_lock_traces() {
-    sudo -n test -d "$SLS_TRACE_DIR" 2>/dev/null || { echo '?'; return 0; }
-    sudo -n grep -rlZ '"type": "split_lock"' "$SLS_TRACE_DIR" 2>/dev/null | tr -cd '\0' | wc -c || true
+sls_split_lock_traces() { # $1 = "sudo" in apply (credentials validated), default "sudo -n" (state/--check, no prompt)
+    local S="${1:-sudo -n}"
+    $S test -d "$SLS_TRACE_DIR" 2>/dev/null || { echo '?'; return 0; }
+    $S grep -rlZ '"type": "split_lock"' "$SLS_TRACE_DIR" 2>/dev/null | tr -cd '\0' | wc -c || true
 }
 have_ip() { command -v inputplumber >/dev/null 2>&1 && [ -f /usr/lib/systemd/system/inputplumber.service ]; }
 # the hid-oxp-bound MCU config interface (iface 2, has the gamepad_mode attribute)
@@ -1146,7 +1156,6 @@ else
 fi
 say "   1) $GRUB_D_FILE (nvme.noacpi=1) + update-grub   $(nvme_bug_present && echo "[SSD matches]" || echo "[SKIPPED: not the affected SSD; use --force-nvme]")"
 say "   2) $MODPROBE_FILE (xe enable_dsb=0)"
-say "  10) $SPLITLOCK_FILE (split_lock_detect=off) + update-grub, and remove the split-lock reports steamos-log-submitter queued   $(have_split_lock_detect && echo "[CPU has split-lock detection]" || echo "[SKIPPED: the CPU has no split-lock detection]")"
 say "   3) $LUA_HDR (gamescope HDR lua) and remove 99-oxp3-nohdr.lua"
 say "   4) $VOLKEY_PY + $VOLKEY_UNIT (volume-key fix)   $(have_evdev && echo "[python3-evdev OK]" || echo "[SKIPPED: python3 evdev missing]")"
 say "   5) $IP_YAML + $IP_CAPMAP + enable inputplumber   $(have_ip && echo "[inputplumber OK]" || echo "[SKIPPED: inputplumber missing]")"
@@ -1162,6 +1171,7 @@ else
     say "   7) gyro (experimental): not enabled (opt in with --gyro)"
 fi
 say "   8) $TDP_SH + $TDP_UNIT (MSR package PL1 follows the MMIO PL1)   $(have_rapl && echo "[RAPL OK]" || echo "[SKIPPED: no MSR/MMIO package RAPL]")"
+say "   9) $SPLITLOCK_FILE (split_lock_detect=off) + update-grub, and remove the split-lock reports steamos-log-submitter queued   $(have_split_lock_detect && echo "[CPU has split-lock detection]" || echo "[SKIPPED: the CPU has no split-lock detection]")"
 if [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then read -r -p "  Continue? (y/N) " _ans; case "$_ans" in y|Y) ;; *) say "  cancelled."; exit 0 ;; esac; fi
 sudo -v
 
@@ -1313,9 +1323,10 @@ else
     say "  [error] split_lock_detect=off NOT found in grub.cfg, check manually"
 fi
 [ "$SL_OK" = 1 ] || NEED_REBOOT=1
-SL_TRACES="$(sls_split_lock_traces)"
+SL_TRACES="$(sls_split_lock_traces sudo)"
 case "$SL_TRACES" in
-    0|'?') ;;
+    0) ;;
+    '?') say "  [warn] could not read $SLS_TRACE_DIR, queued split-lock reports not checked" ;;
     *) if sudo grep -rlZ '"type": "split_lock"' "$SLS_TRACE_DIR" 2>/dev/null | sudo xargs -0 -r rm -f; then
            say "  [remove] $SL_TRACES queued split-lock reports from $SLS_TRACE_DIR"; CHANGED=1
        else
