@@ -73,6 +73,8 @@ TESTED_KERNEL_PREFIX="7.2.0-valve1"
 #     7) [EXPERIMENTAL, opt-in] gyroscope - ACPI override so the kernel sees the BMI260 + patched InputPlumber (Steam Deck gyro)
 #     8) TDP sync service - the MSR package PL1 (obeyed by the GPU) follows the MMIO PL1 that TDP tools set
 #     9) kernel param split_lock_detect=off - stops the split-lock report flood (journal + steamos-log-submitter queue)
+#    10) CPU power for the performance overlay - a root service publishes a coarse (0.5 s, 10 mJ) world-readable copy of the
+#        package energy counter, which the kernel keeps root-only (CVE-2020-8694), so the overlay shows the CPU power
 # Usage:
 #   ./oxp3-apply-fixes.sh                apply (asks sudo password, prints the plan and confirms)
 #   ./oxp3-apply-fixes.sh --check        check only, changes nothing, needs no sudo (covers every fix, gyro included when enabled)
@@ -126,6 +128,8 @@ BATT_SH="$USER_HOME/oxp3-fix/oxp3-battery-clamp.sh"          # in /home, survive
 BATT_UNIT=/etc/systemd/system/oxp3-battery-clamp.service
 TDP_SH="$USER_HOME/oxp3-fix/oxp3-tdp-sync.sh"                # in /home, survives updates
 TDP_UNIT=/etc/systemd/system/oxp3-tdp-sync.service
+RAPL_PY="$USER_HOME/oxp3-fix/oxp3-rapl-overlay.py"          # in /home, survives updates
+RAPL_UNIT=/etc/systemd/system/oxp3-rapl-overlay.service
 IP_YAML=/etc/inputplumber/devices.d/50-onexplayer_3.yaml
 IP_CAPMAP=/etc/inputplumber/capability_maps.d/onexplayer_type3.yaml   # id oxp3: Home key -> Guide   # InputPlumber 0.78 override dir is devices.d
 # experimental gyro (step 7)
@@ -444,7 +448,8 @@ write_fixed() { # write_fixed <file> <width> <value>: in-place, no truncation (s
 
 case "$1" in
     --stop)
-        for a in capacity energy_full; do mountpoint -q "$REALDIR/$a" && umount "$REALDIR/$a"; done
+        # lazy: readers such as Steam keep the file open, a plain umount would fail with "target is busy"
+        for a in capacity energy_full; do while mountpoint -q "$REALDIR/$a"; do umount -l "$REALDIR/$a" || break; done; done
         exit 0 ;;
     --once)
         if ! mkdir -p "$DIR" 2>/dev/null || [ ! -w "$DIR" ]; then   # not root: keep the service's state untouched
@@ -698,6 +703,114 @@ EOT
 )
 TDP_UNIT_CONTENT="${TDP_UNIT_CONTENT//__TDP_SH__/$TDP_SH}"
 
+# ---- CPU power for the overlay (step 10) ------------------------------
+RAPL_PY_CONTENT=$(cat <<'EOT'
+#!/usr/bin/python3
+# oxp3-rapl-overlay.py - let the performance overlay show the CPU package power without exposing the raw RAPL counter.
+#
+# The overlay (mangoapp, MangoHud) runs as the desktop user and reads /sys/class/powercap/intel-rapl:0/energy_uj, which
+# the kernel keeps root-only since the PLATYPUS power side channel (CVE-2020-8694): with the raw counter (updated about
+# every millisecond, microjoule resolution) an unprivileged program can sample the energy of short code paths. So the
+# overlay shows no CPU power ("Failed to initialize CPU power data" in the journal).
+#
+# Fix: a root service opens the real counter once, then bind-mounts a world-readable copy over the attribute and
+# refreshes it twice a second, rounded down to 10 mJ. That is plenty for a power reading over the overlay's
+# 500 ms window, and useless for the side channel, which needs thousands of samples per second. Only the package
+# counter of the MSR zone is covered; every other RAPL counter stays root-only. The copy is a monotonic counter that
+# never wraps. Run as a root service (see the fix pack). --stop removes the overlay (systemctl stop does it too).
+import os
+import subprocess
+import sys
+import time
+
+REAL = "/sys/class/powercap/intel-rapl:0/energy_uj"
+RANGE = "/sys/class/powercap/intel-rapl:0/max_energy_range_uj"
+RUNDIR = "/run/oxp3-rapl"
+COPY = RUNDIR + "/energy_uj"
+PERIOD = 0.5         # s between refreshes
+QUANTUM = 10000      # uJ (10 mJ) resolution of the copy
+WIDTH = 20           # fixed width, so every refresh is one same-length in-place write
+
+
+def mounted() -> bool:
+    return subprocess.run(["mountpoint", "-q", REAL]).returncode == 0
+
+
+def unmount() -> None:
+    # lazy: the overlay keeps the file open, so a plain umount fails with "target is busy". Detaching is enough: a reader
+    # holding the old copy keeps reading the same tmpfs file, which the next run keeps updating.
+    for _ in range(10):
+        if not mounted():
+            return
+        subprocess.run(["umount", "-l", REAL], check=False)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--stop":
+    unmount()
+    sys.exit(0)
+
+if not os.path.exists(REAL):
+    print("no intel-rapl:0 package zone, nothing to do")
+    sys.exit(0)
+
+unmount()                                   # a stale overlay from an earlier run would hide the real counter
+real = os.open(REAL, os.O_RDONLY)           # kept open: after the bind mount this fd is the only way to the real file
+with open(RANGE) as f:
+    wrap = int(f.read()) + 1
+
+
+def read_real() -> int:
+    return int(os.pread(real, 64, 0))
+
+
+os.makedirs(RUNDIR, mode=0o755, exist_ok=True)
+fd = os.open(COPY, os.O_RDWR | os.O_CREAT, 0o444)   # same file (inode) across restarts, see unmount()
+os.fchmod(fd, 0o444)
+try:
+    total = int(os.pread(fd, 64, 0) or b"0")      # continue the published count, so a reader never sees it go back
+except ValueError:
+    total = 0
+
+
+def publish(value: int) -> None:
+    os.pwrite(fd, b"%0*d\n" % (WIDTH, value), 0)
+
+
+publish(total)
+subprocess.run(["mount", "--bind", COPY, REAL], check=True)
+last = read_real()
+print(f"overlay active: {REAL} -> world-readable copy, {PERIOD} s / {QUANTUM // 1000} mJ")
+sys.stdout.flush()
+while True:
+    time.sleep(PERIOD)
+    now = read_real()
+    total += now - last if now >= last else now + wrap - last
+    last = now
+    publish(total - total % QUANTUM)
+EOT
+)
+
+RAPL_UNIT_CONTENT=$(cat <<'EOT'
+[Unit]
+Description=OXP3: coarse world-readable copy of the CPU package energy counter for the performance overlay
+# see the header of __RAPL_PY__ ; revert: systemctl disable --now oxp3-rapl-overlay.service
+After=basic.target
+Before=display-manager.service
+ConditionPathExists=/sys/class/powercap/intel-rapl:0/energy_uj
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 __RAPL_PY__
+ExecStopPost=/usr/bin/python3 __RAPL_PY__ --stop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOT
+)
+RAPL_UNIT_CONTENT="${RAPL_UNIT_CONTENT//__RAPL_PY__/$RAPL_PY}"
+
 # ---- experimental gyro (step 7) contents ------------------------------
 GRUB_IMU_CONTENT=$(cat <<'EOT'
 # ACPI table override for the gyroscope (experimental): renames the IMU node so the kernel's bmi270 driver binds.
@@ -842,7 +955,8 @@ hdr()  { printf '\n== %s ==\n' "$*"; }
 same_content() { # same_content <file> <content>  -> 0 if identical
     [ -f "$1" ] && [ "$(cat "$1")" = "$2" ]
 }
-CHANGED=0; NEED_REBOOT=0; NEED_RELOGIN=0; VOLKEY_RESTART=0; IP_RESTART=0; BATT_RESTART=0; TDP_RESTART=0
+CHANGED=0; NEED_REBOOT=0; NEED_RELOGIN=0; VOLKEY_RESTART=0; IP_RESTART=0; BATT_RESTART=0; TDP_RESTART=0; RAPL_RESTART=0
+have_rapl_pkg() { [ -e /sys/class/powercap/intel-rapl:0/energy_uj ]; }
 have_rapl() { [ -r /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw ] && [ -r /sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw ]; }
 
 # ---- guards -----------------------------------------------------------
@@ -975,6 +1089,10 @@ if have_rapl; then
     say "  package power limit PL1 : MMIO $(( $(cat /sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw) / 1000000 )) W, MSR $(( $(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw) / 1000000 )) W   (the GPU obeys MSR; they should match)"
     if systemctl is-active -q oxp3-tdp-sync.service 2>/dev/null; then say "  TDP sync service oxp3-tdp-sync : active"; else say "  TDP sync service oxp3-tdp-sync : inactive/missing"; fi
 fi
+if have_rapl_pkg; then
+    if findmnt -n -T /sys/class/powercap/intel-rapl:0/energy_uj -o SOURCE 2>/dev/null | grep -q oxp3-rapl; then RAPL_STATE="coarse copy published (overlay can read it)"; else RAPL_STATE="root-only (overlay shows no CPU power)"; fi
+    say "  CPU power for the overlay : $RAPL_STATE"
+fi
 if [ "$GYRO_ON" = 1 ]; then
     say "  gyro (experimental) : enabled ; IMU $([ "$IMU_ACTIVE" = 1 ] && echo "visible to the kernel (ACPI override active)" || echo "NOT visible yet (ACPI override not loaded: reboot needed)") ; patched InputPlumber $(gyro_bin_ok && echo present || echo missing)"
 elif [ "$GYRO_WANT" = 1 ]; then
@@ -1038,6 +1156,11 @@ if [ "$MODE" = "--check" ]; then
         same_content "$TDP_SH" "$TDP_SH_CONTENT" || { say "  [diff] TDP sync script missing or differs"; ok=0; }
         same_content "$TDP_UNIT" "$TDP_UNIT_CONTENT" || { say "  [diff] TDP sync unit missing or differs"; ok=0; }
         systemctl is-enabled -q oxp3-tdp-sync.service 2>/dev/null || { say "  [diff] oxp3-tdp-sync.service not enabled"; ok=0; }
+    fi
+    if have_rapl_pkg; then
+        same_content "$RAPL_PY" "$RAPL_PY_CONTENT" || { say "  [diff] CPU power overlay script missing or differs"; ok=0; }
+        same_content "$RAPL_UNIT" "$RAPL_UNIT_CONTENT" || { say "  [diff] CPU power overlay unit missing or differs"; ok=0; }
+        systemctl is-enabled -q oxp3-rapl-overlay.service 2>/dev/null || { say "  [diff] oxp3-rapl-overlay.service not enabled"; ok=0; }
     fi
     same_content "$IP_YAML" "$IP_YAML_CONTENT" || { say "  [diff] IP yaml missing or differs"; ok=0; }
     same_content "$IP_CAPMAP" "$IP_CAPMAP_CONTENT" || { say "  [diff] IP capability map missing or differs"; ok=0; }
@@ -1123,6 +1246,8 @@ if [ "$MODE" = "--revert" ]; then
     if [ -f "$BATT_SH" ]; then rm -f "$BATT_SH"; say "  removed $BATT_SH"; fi
     if [ -f "$TDP_UNIT" ]; then sudo systemctl disable --now oxp3-tdp-sync.service 2>/dev/null || true; sudo rm -f "$TDP_UNIT"; sudo systemctl daemon-reload; say "  oxp3-tdp-sync.service stopped and removed (MSR PL1 back to the firmware value)"; fi
     if [ -f "$TDP_SH" ]; then rm -f "$TDP_SH"; say "  removed $TDP_SH"; fi
+    if [ -f "$RAPL_UNIT" ]; then sudo systemctl disable --now oxp3-rapl-overlay.service 2>/dev/null || true; sudo rm -f "$RAPL_UNIT"; sudo systemctl daemon-reload; say "  oxp3-rapl-overlay.service stopped and removed (CPU energy counter root-only again)"; fi
+    if [ -f "$RAPL_PY" ]; then rm -f "$RAPL_PY"; say "  removed $RAPL_PY"; fi
     if [ -f "$LUA_HDR" ]; then mv -f "$LUA_HDR" "$USER_HOME/oxp3-oled-hdr.lua.disabled"; say "  HDR lua moved to $USER_HOME/oxp3-oled-hdr.lua.disabled"; NEED_RELOGIN=1; fi
     if [ -f "$LUA_NOHDR_BAK" ] && [ ! -f "$LUA_NOHDR" ]; then mkdir -p "$LUA_DIR"; cp -f "$LUA_NOHDR_BAK" "$LUA_NOHDR"; say "  nohdr lua restored (prevents a black screen when HDR is on)"; NEED_RELOGIN=1; fi
     say "revert done. (The Wi-Fi firmware step is not undone: linux-firmware stays installed.)"
@@ -1172,6 +1297,7 @@ else
 fi
 say "   8) $TDP_SH + $TDP_UNIT (MSR package PL1 follows the MMIO PL1)   $(have_rapl && echo "[RAPL OK]" || echo "[SKIPPED: no MSR/MMIO package RAPL]")"
 say "   9) $SPLITLOCK_FILE (split_lock_detect=off) + update-grub, and remove the split-lock reports steamos-log-submitter queued   $(have_split_lock_detect && echo "[CPU has split-lock detection]" || echo "[SKIPPED: the CPU has no split-lock detection]")"
+say "  10) $RAPL_PY + $RAPL_UNIT (CPU power for the performance overlay, coarse copy of the energy counter)   $(have_rapl_pkg && echo "[RAPL OK]" || echo "[SKIPPED: no intel-rapl:0]")"
 if [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then read -r -p "  Continue? (y/N) " _ans; case "$_ans" in y|Y) ;; *) say "  cancelled."; exit 0 ;; esac; fi
 sudo -v
 
@@ -1563,6 +1689,33 @@ fi
 if [ "$TDP_RESTART" = 1 ] || ! systemctl is-active -q oxp3-tdp-sync.service 2>/dev/null; then
     sudo systemctl restart oxp3-tdp-sync.service && sleep 1 && say "  [restart] oxp3-tdp-sync.service ($(bash "$TDP_SH" --once | tr '
 ' ';' | sed 's/;$//'))"
+fi
+fi
+
+# e7. CPU power for the overlay (root service; coarse world-readable copy of the package energy counter, no reboot)
+if ! have_rapl_pkg; then
+    say "  [skip] no intel-rapl:0 package zone, skipping the CPU power overlay"
+else
+mkdir -p "$(dirname "$RAPL_PY")"
+if same_content "$RAPL_PY" "$RAPL_PY_CONTENT"; then
+    say "  [skip] $RAPL_PY unchanged"
+else
+    printf '%s\n' "$RAPL_PY_CONTENT" > "$RAPL_PY"; chmod +x "$RAPL_PY"
+    say "  [write] $RAPL_PY"; CHANGED=1; RAPL_RESTART=1
+fi
+if same_content "$RAPL_UNIT" "$RAPL_UNIT_CONTENT"; then
+    say "  [skip] $RAPL_UNIT unchanged"
+else
+    printf '%s\n' "$RAPL_UNIT_CONTENT" | sudo tee "$RAPL_UNIT" >/dev/null
+    sudo systemctl daemon-reload
+    say "  [write] $RAPL_UNIT"; CHANGED=1; RAPL_RESTART=1
+fi
+if ! systemctl is-enabled -q oxp3-rapl-overlay.service 2>/dev/null; then
+    sudo systemctl enable oxp3-rapl-overlay.service >/dev/null 2>&1
+    say "  [enable] oxp3-rapl-overlay.service"; CHANGED=1; RAPL_RESTART=1
+fi
+if [ "$RAPL_RESTART" = 1 ] || ! systemctl is-active -q oxp3-rapl-overlay.service 2>/dev/null; then
+    sudo systemctl restart oxp3-rapl-overlay.service && say "  [restart] oxp3-rapl-overlay.service (the overlay picks it up when it restarts, e.g. after re-entering game mode)"
 fi
 fi
 
