@@ -1,12 +1,20 @@
 #!/bin/bash
 # oxp3-steamos-fixes - ONEXPLAYER 3 (Intel Panther Lake) SteamOS fix pack
-# Version: 20261015     License: MIT (see LICENSE)     Author: HANA & Claude
+# Version: 20261016     License: MIT (see LICENSE)     Author: HANA & Claude
 # Tested on: SteamOS 3.10 main build 20260827.1000, kernel 7.2.0-valve1-1-neptune-72, OXP3 BIOS 5.09,
 #            panel Samsung SDC AMS881KB01-0, SSD Predator GM7 1TB (Biwin/Maxio 1dee:1602)
 # v1.1.0: gamescope HDR lua now also registers real 30-144Hz dynamic_modegen (this panel has genuine
 #         continuous VRR; the v1.0.1 lua declared dynamic_refresh_rates but never shipped the
 #         matching dynamic_modegen function, so no extra Hz options ever actually appeared in the
 #         Steam Performance panel's per-game refresh-rate selector).
+# 20261016: new step 10, CPU and GPU power/temperature in the performance overlay: a root service publishes coarse
+#         (0.5 s, 10 mJ) world-readable copies of the package and PP1 energy counters, and a patched mangoapp (binary in the
+#         release archive, sha256 pinned, falls back to the stock one) reads GPU power from PP1 and the GPU temperature
+#         from the package sensor. This replaces the opt-in udev rule of 20261015, which made the raw counter world-readable.
+#         New step 11, DMC v2.20 pin: SteamOS 20261015.1000 ships DMC v2.36, which caps VRR at 70-80 fps (issue #1).
+#         New step 12, speaker route check: after a boot or resume the jack detection can leave PipeWire on the
+#         Headphones profile with the speakers switched off; a user unit selects the Speaker profile when the jack is empty.
+#         Sysfs overlays (battery clamp, RAPL copies) are detached lazily, so restarts no longer stack mounts.
 # 20261015: new step 9, split-lock flood (contributed by kas5852, PR #16). Panther Lake traps user-space split locks and
 #         Steam causes them continuously; steamos-manager logs every one and steamos-log-submitter queues one report file
 #         per hit (seen: 119,091 files / 479 MB on BIOS 5.09, 361,102 on 5.12), which also pushed everything else out of the
@@ -51,7 +59,7 @@
 #         the hid-oxp sysfs (driver pages 1-2 only, never raw hidraw); new --mcu-restore (DANGEROUS, explicit, confirmed)
 #         rewrites MCU button-table page 3 (Home 0x24 + factory-default 0x21/0x25-0x2B) to recover a Home/Xbox
 #         key that went silent after a foreign tool overwrote the MCU table.
-OXP3_FIXES_VERSION="20261015"
+OXP3_FIXES_VERSION="20261016"
 TESTED_STEAMOS_BUILD="20260827.1000"
 TESTED_KERNEL_PREFIX="7.2.0-valve1"
 # ============================================================================
@@ -73,6 +81,14 @@ TESTED_KERNEL_PREFIX="7.2.0-valve1"
 #     7) [EXPERIMENTAL, opt-in] gyroscope - ACPI override so the kernel sees the BMI260 + patched InputPlumber (Steam Deck gyro)
 #     8) TDP sync service - the MSR package PL1 (obeyed by the GPU) follows the MMIO PL1 that TDP tools set
 #     9) kernel param split_lock_detect=off - stops the split-lock report flood (journal + steamos-log-submitter queue)
+#    10) CPU and GPU power/temperature in the performance overlay - a root service publishes coarse (0.5 s, 10 mJ) world-
+#        readable copies of the package and GPU (PP1) energy counters, which the kernel keeps root-only (CVE-2020-8694), and
+#        a patched mangoapp (mangoapp/ in the repo, binary in the release archive) reads GPU power from PP1 and the GPU
+#        temperature from the package sensor, because the integrated xe GPU has no hwmon device
+#    11) display firmware DMC v2.20 - newer DMC releases (v2.36 in upstream linux-firmware, which SteamOS ships from
+#        20261015.1000 on) cap the frame rate at 70-80 fps with VRR; v2.20 goes into /usr/lib/firmware/updates
+#    12) speakers silent after boot or resume - the jack detection briefly reports headphones and PipeWire keeps the
+#        Headphones profile; a user unit re-selects the Speaker profile when the jack is empty (only on that mismatch)
 # Usage:
 #   ./oxp3-apply-fixes.sh                apply (asks sudo password, prints the plan and confirms)
 #   ./oxp3-apply-fixes.sh --check        check only, changes nothing, needs no sudo (covers every fix, gyro included when enabled)
@@ -126,6 +142,20 @@ BATT_SH="$USER_HOME/oxp3-fix/oxp3-battery-clamp.sh"          # in /home, survive
 BATT_UNIT=/etc/systemd/system/oxp3-battery-clamp.service
 TDP_SH="$USER_HOME/oxp3-fix/oxp3-tdp-sync.sh"                # in /home, survives updates
 TDP_UNIT=/etc/systemd/system/oxp3-tdp-sync.service
+RAPL_PY="$USER_HOME/oxp3-fix/oxp3-rapl-overlay.py"          # in /home, survives updates
+RAPL_UNIT=/etc/systemd/system/oxp3-rapl-overlay.service
+MANGO_BIN="$USER_HOME/oxp3-fix/mangoapp-oxp3"               # patched mangoapp (source: mangoapp/ in the repo)
+MANGO_LAUNCH="$USER_HOME/oxp3-fix/oxp3-mangoapp-launch.sh"   # starts MANGO_BIN, or the stock mangoapp when it cannot run
+MANGO_DROPIN=/etc/systemd/user/gamescope-mangoapp.service.d/oxp3-mangoapp.conf
+MANGO_FOR="0.8.3.rc1.r24.g33c2c7dd"                         # the SteamOS mangohud package the patch was built from
+MANGO_SHA256="beaae37cb2defa1af0cf5b7f6a0eed31fc7d4796a58743764fd74f20b418e246"
+DMC_NAME=i915/xe3lpd_dmc.bin                                 # the Panther Lake display controller firmware
+DMC_OVERRIDE=/usr/lib/firmware/updates/$DMC_NAME.zst         # firmware/updates takes precedence over the packaged file
+DMC_SHA256="150eaa60a776e489f69e6f334d4c12216c0d686f3a53ac2228d0a6ce48f8add9"   # v2.20 (.zst) from linux-firmware-neptune 20260910
+AUDIO_SH="$USER_HOME/oxp3-fix/oxp3-audio-route.sh"          # in /home, survives updates
+AUDIO_UNIT="$USER_HOME/.config/systemd/user/oxp3-audio-route.service"   # user unit, in /home too
+AUDIO_RESUME_UNIT=/etc/systemd/system/oxp3-audio-resume.service  # runs the user unit again after every resume
+AUDIO_USER="$(stat -c %U "$USER_HOME" 2>/dev/null || id -un)"
 IP_YAML=/etc/inputplumber/devices.d/50-onexplayer_3.yaml
 IP_CAPMAP=/etc/inputplumber/capability_maps.d/onexplayer_type3.yaml   # id oxp3: Home key -> Guide   # InputPlumber 0.78 override dir is devices.d
 # experimental gyro (step 7)
@@ -141,7 +171,8 @@ GRUB_IMU_FILE=/etc/default/grub.d/oxp3-imu.cfg
 GYRO_BIOS="5.09"                                             # the ACPI override is a patched copy of this BIOS's SSDT26
 GYRO_IP_SERIES="0.78"                                        # the patched build is InputPlumber 0.78.0
 GYRO_BIN_SHA256="1107d95c34863c7865cac64183673135098d77265a32763c22fc7efbc1893aa3"
-GYRO_PKG_URL="https://github.com/HHHHanasak1/onexplayer3-steamos-setup/releases/download/20261015/oxp3-fix.tar.gz"   # release archive holding the binary
+PKG_URL="https://github.com/HHHHanasak1/onexplayer3-steamos-setup/releases/download/20261016/oxp3-fix.tar.gz"
+GYRO_PKG_URL="$PKG_URL"   # release archive holding the binary
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"                  # the extracted release archive, if the script came from it
 ACPI_IMG_SHA256="0e9b716e65978ac7365fda6fddf476a18b352a2d1ed98f4f30c8d3f8558b2113"
 ACPI_IMG_OLD_SHA256="2d1a0a88e4cfe694cd4edc9b0d0a5e28f7f3f5bb9ccdcf7cbf1d5d01a02d42ad"   # earlier build of the same table (long cpio member name)
@@ -444,7 +475,8 @@ write_fixed() { # write_fixed <file> <width> <value>: in-place, no truncation (s
 
 case "$1" in
     --stop)
-        for a in capacity energy_full; do mountpoint -q "$REALDIR/$a" && umount "$REALDIR/$a"; done
+        # lazy: readers such as Steam keep the file open, a plain umount would fail with "target is busy"
+        for a in capacity energy_full; do while mountpoint -q "$REALDIR/$a"; do umount -l "$REALDIR/$a" || break; done; done
         exit 0 ;;
     --once)
         if ! mkdir -p "$DIR" 2>/dev/null || [ ! -w "$DIR" ]; then   # not root: keep the service's state untouched
@@ -698,6 +730,245 @@ EOT
 )
 TDP_UNIT_CONTENT="${TDP_UNIT_CONTENT//__TDP_SH__/$TDP_SH}"
 
+# ---- CPU power for the overlay (step 10) ------------------------------
+RAPL_PY_CONTENT=$(cat <<'EOT'
+#!/usr/bin/python3
+# oxp3-rapl-overlay.py - let the performance overlay show CPU and GPU power without exposing the raw RAPL counters.
+#
+# The overlay (mangoapp, MangoHud) runs as the desktop user and reads RAPL energy counters, which the kernel keeps
+# root-only since the PLATYPUS power side channel (CVE-2020-8694): with a raw counter (updated about every millisecond,
+# microjoule resolution) an unprivileged program can sample the energy of short code paths. So the overlay shows no
+# CPU power ("Failed to initialize CPU power data" in the journal).
+#
+# Fix: a root service opens the real counters once, then bind-mounts world-readable copies over the attributes and
+# refreshes them twice a second, rounded down to 10 mJ. That is plenty for a power reading over the overlay's 500 ms
+# window, and useless for the side channel, which needs thousands of samples per second. Covered zones:
+#   intel-rapl:0    package-0  CPU power (read by stock MangoHud)
+#   intel-rapl:0:1  uncore     RAPL PP1, the graphics power plane (read by the patched mangoapp for the integrated GPU)
+# Every other RAPL counter stays root-only. The copies are monotonic counters that never wrap.
+# Run as a root service (see the fix pack). --stop removes the overlays (systemctl stop does it too).
+import os
+import subprocess
+import sys
+import time
+
+BASE = "/sys/class/powercap"
+ZONES = [("intel-rapl:0", "package-0"), ("intel-rapl:0:1", "uncore")]
+RUNDIR = "/run/oxp3-rapl"
+PERIOD = 0.5         # s between refreshes
+QUANTUM = 10000      # uJ (10 mJ) resolution of the copies
+WIDTH = 20           # fixed width, so every refresh is one same-length in-place write
+
+
+def real_path(zone: str) -> str:
+    return f"{BASE}/{zone}/energy_uj"
+
+
+def mounted(path: str) -> bool:
+    return subprocess.run(["mountpoint", "-q", path]).returncode == 0
+
+
+def unmount(path: str) -> None:
+    # lazy: the overlay keeps the file open, so a plain umount fails with "target is busy". Detaching is enough: a reader
+    # holding the old copy keeps reading the same tmpfs file, which the next run keeps updating.
+    for _ in range(10):
+        if not mounted(path):
+            return
+        subprocess.run(["umount", "-l", path], check=False)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--stop":
+    for zone, _ in ZONES:
+        unmount(real_path(zone))
+    sys.exit(0)
+
+os.makedirs(RUNDIR, mode=0o755, exist_ok=True)
+zones = []
+for zone, name in ZONES:
+    path = real_path(zone)
+    try:
+        with open(f"{BASE}/{zone}/name") as f:
+            if f.read().strip() != name:
+                continue
+    except OSError:
+        continue
+    unmount(path)                           # a stale overlay from an earlier run would hide the real counter
+    real = os.open(path, os.O_RDONLY)       # kept open: after the bind mount this fd is the only way to the real file
+    with open(f"{BASE}/{zone}/max_energy_range_uj") as f:
+        wrap = int(f.read()) + 1
+    copy = f"{RUNDIR}/{zone}.energy_uj"
+    fd = os.open(copy, os.O_RDWR | os.O_CREAT, 0o444)   # same file (inode) across restarts, see unmount()
+    os.fchmod(fd, 0o444)
+    try:
+        total = int(os.pread(fd, 64, 0) or b"0")  # continue the published count, so a reader never sees it go back
+    except ValueError:
+        total = 0
+    zones.append({"path": path, "real": real, "wrap": wrap, "copy": copy, "fd": fd, "total": total})
+
+if not zones:
+    print("no RAPL package zone, nothing to do")
+    sys.exit(0)
+
+
+def read_real(z) -> int:
+    return int(os.pread(z["real"], 64, 0))
+
+
+def publish(z) -> None:
+    v = z["total"] - z["total"] % QUANTUM
+    os.pwrite(z["fd"], b"%0*d\n" % (WIDTH, v), 0)
+
+
+for z in zones:
+    publish(z)
+    subprocess.run(["mount", "--bind", z["copy"], z["path"]], check=True)
+    z["last"] = read_real(z)
+print(f"overlay active for {', '.join(z['path'] for z in zones)}: world-readable copies, {PERIOD} s / {QUANTUM // 1000} mJ")
+sys.stdout.flush()
+while True:
+    time.sleep(PERIOD)
+    for z in zones:
+        now = read_real(z)
+        z["total"] += now - z["last"] if now >= z["last"] else now + z["wrap"] - z["last"]
+        z["last"] = now
+        publish(z)
+EOT
+)
+
+RAPL_UNIT_CONTENT=$(cat <<'EOT'
+[Unit]
+Description=OXP3: coarse world-readable copies of the CPU package and GPU (PP1) energy counters for the performance overlay
+# see the header of __RAPL_PY__ ; revert: systemctl disable --now oxp3-rapl-overlay.service
+After=basic.target
+Before=display-manager.service
+ConditionPathExists=/sys/class/powercap/intel-rapl:0/energy_uj
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 __RAPL_PY__
+ExecStopPost=/usr/bin/python3 __RAPL_PY__ --stop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOT
+)
+RAPL_UNIT_CONTENT="${RAPL_UNIT_CONTENT//__RAPL_PY__/$RAPL_PY}"
+
+MANGO_LAUNCH_CONTENT=$(cat <<'EOT'
+#!/bin/sh
+# Starts the OXP3 build of mangoapp (adds GPU power and temperature for the integrated xe GPU) through the systemd user
+# drop-in oxp3-mangoapp.conf. The stock /usr/bin/mangoapp starts instead when the binary is missing, cannot load its
+# libraries, was built for another mangohud version, or crashed three times within a minute, so the overlay never
+# depends on this build.
+B=__MANGO_BIN__
+STOCK=/usr/bin/mangoapp
+LOG="${XDG_RUNTIME_DIR:-/tmp}/oxp3-mangoapp.starts"
+now=$(date +%s)
+recent=$(awk -v n="$now" '$1 > n - 60' "$LOG" 2>/dev/null | wc -l)
+echo "$now" >> "$LOG"
+if [ "$recent" -lt 3 ] && [ -x "$B" ] && ! ldd "$B" 2>&1 | grep -q 'not found'; then
+    case "$(pacman -Q mangohud 2>/dev/null)" in
+        "mangohud __MANGO_FOR__-"*) exec "$B" "$@" ;;
+    esac
+fi
+echo "oxp3: patched mangoapp not used here (version, libraries or repeated crashes), starting the stock one" >&2
+exec "$STOCK" "$@"
+EOT
+)
+
+MANGO_DROPIN_CONTENT=$(cat <<'EOT'
+# OXP3: start mangoapp through a launcher that adds GPU power/temperature and falls back to the stock binary.
+# Revert: ./oxp3-apply-fixes.sh --revert (or rm this file, systemctl --user daemon-reload)
+[Service]
+ExecStart=
+ExecStart=__MANGO_LAUNCH__
+EOT
+)
+MANGO_LAUNCH_CONTENT="${MANGO_LAUNCH_CONTENT//__MANGO_BIN__/$MANGO_BIN}"
+MANGO_LAUNCH_CONTENT="${MANGO_LAUNCH_CONTENT//__MANGO_FOR__/$MANGO_FOR}"
+MANGO_DROPIN_CONTENT="${MANGO_DROPIN_CONTENT//__MANGO_LAUNCH__/$MANGO_LAUNCH}"
+
+# ---- speaker route check (step 12) contents ---------------------------
+AUDIO_SH_CONTENT=$(cat <<'EOT'
+#!/bin/sh
+# oxp3-audio-route.sh - the speakers stay silent after a boot or resume although nothing is plugged into the headphone jack.
+#
+# The jack detection reports "plugged" for a moment while the codec (Realtek ALC245) powers up. PipeWire picks the
+# Headphones card profile from that and misses the later "unplugged" event, so the speaker amplifier stays switched off
+# until WirePlumber is restarted. This check runs a few times shortly after the session starts and after every resume
+# (user unit oxp3-audio-route.service, started by the fix pack's resume hook). It only acts on a mismatch: the ALSA
+# "Headphone Jack" control is off, but the active profile is a Headphones profile. It then selects the matching Speaker
+# profile, or restarts WirePlumber when that does not take. A plugged-in headset is never touched.
+log() { echo "oxp3-audio-route: $*"; }
+
+check() {
+    pactl list cards 2>/dev/null | awk '
+        /^Card #/ { if (name != "") print name "\t" alsa "\t" active "\t" spk; name = ""; alsa = ""; active = ""; spk = ""; inprof = 0 }
+        /^\tName: / { name = $2 }
+        /api\.alsa\.card = / { v = $3; gsub(/"/, "", v); alsa = v }
+        /^\tProfiles:/ { inprof = 1; next }
+        /^\tActive Profile: / { inprof = 0; sub(/^\tActive Profile: /, ""); active = $0 }
+        inprof && /^\t\t/ { p = $0; sub(/^\t\t/, "", p); sub(/: .*/, "", p); if (p ~ /Speaker/ && p !~ /Headphones/) spk = p }
+        /^\t[A-Z]/ && !/^\tProfiles:/ { inprof = 0 }
+        END { if (name != "") print name "\t" alsa "\t" active "\t" spk }' |
+    while IFS="$(printf '\t')" read -r card alsa active spk; do
+        case "$active" in *Headphones*) ;; *) continue ;; esac
+        [ -n "$spk" ] && [ -n "$alsa" ] || continue
+        amixer -c "$alsa" cget iface=CARD,name='Headphone Jack' 2>/dev/null | grep -q ': values=off' || continue
+        log "nothing in the headphone jack, but $card uses \"$active\": switching to \"$spk\""
+        pactl set-card-profile "$card" "$spk"
+        sleep 2
+        if pactl list cards 2>/dev/null | grep -q "Active Profile: $spk\$"; then
+            log "speaker profile active"
+        else
+            log "the profile did not change, restarting WirePlumber"
+            systemctl --user restart wireplumber.service
+        fi
+    done
+}
+
+# the jack settles within a few seconds; check a few times so a late wrong selection is caught too
+for d in 3 7 20; do
+    sleep "$d"
+    check
+done
+EOT
+)
+
+AUDIO_UNIT_CONTENT=$(cat <<'EOT'
+[Unit]
+Description=OXP3: select the speakers when the headphone jack is empty (jack misdetection at boot/resume)
+# see the header of __AUDIO_SH__ ; revert: ./oxp3-apply-fixes.sh --revert
+After=wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/bin/sh __AUDIO_SH__
+
+[Install]
+WantedBy=graphical-session.target
+EOT
+)
+AUDIO_UNIT_CONTENT="${AUDIO_UNIT_CONTENT//__AUDIO_SH__/$AUDIO_SH}"
+
+AUDIO_RESUME_UNIT_CONTENT=$(cat <<'EOT'
+[Unit]
+Description=OXP3: re-check the speaker route after resume (starts the user unit oxp3-audio-route.service)
+# revert: systemctl disable --now oxp3-audio-resume.service
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/bin/systemctl --user -M __AUDIO_USER__@ start --no-block oxp3-audio-route.service
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+EOT
+)
+AUDIO_RESUME_UNIT_CONTENT="${AUDIO_RESUME_UNIT_CONTENT//__AUDIO_USER__/$AUDIO_USER}"
+
 # ---- experimental gyro (step 7) contents ------------------------------
 GRUB_IMU_CONTENT=$(cat <<'EOT'
 # ACPI table override for the gyroscope (experimental): renames the IMU node so the kernel's bmi270 driver binds.
@@ -781,6 +1052,127 @@ set_base_yaml() { IP_YAML_CONTENT="$IP_YAML_CONTENT_BASE"; }
 
 # The ACPI override: a cpio image (kernel/firmware/acpi/ssdt-oxp3-imu.aml) holding this BIOS's SSDT26 (Rtd3 I2C_DEVT) with the IMU node
 # renamed 10EC5280 -> BMI0260 (source: gyro/SSDT26-oxp3-imu.dsl). gzip + base64.
+# DMC v2.20 for xe3lpd (Intel firmware, redistributable unmodified under firmware/LICENSE.i915), zstd as shipped, base64
+DMC_B64=$(cat <<'EOT'
+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
+E+rZxAFOeU0W
+EOT
+)
+
 ACPI_IMG_B64=$(cat <<'EOT'
 H4sIAAAAAAAC/+2c328cRx3AZ/2r50tM7OPSlIiES0LbFOrkZmZ/pKUB2XeOdzY+e/Fd2oAL54vtYKdxYiUOTYpEURPa4laUYipR
 WqE7cHkAIR54AYTEG38D6gMIiTeQeIPyFOa7uzczvp37YYwfrPgS3c7ufufz/e7s7H5uV0qyTtbJ4ix88FPzsDDxQrDUfKhduWQR
@@ -842,7 +1234,20 @@ hdr()  { printf '\n== %s ==\n' "$*"; }
 same_content() { # same_content <file> <content>  -> 0 if identical
     [ -f "$1" ] && [ "$(cat "$1")" = "$2" ]
 }
-CHANGED=0; NEED_REBOOT=0; NEED_RELOGIN=0; VOLKEY_RESTART=0; IP_RESTART=0; BATT_RESTART=0; TDP_RESTART=0
+CHANGED=0; NEED_REBOOT=0; NEED_RELOGIN=0; VOLKEY_RESTART=0; IP_RESTART=0; BATT_RESTART=0; TDP_RESTART=0; RAPL_RESTART=0
+have_rapl_pkg() { [ -e /sys/class/powercap/intel-rapl:0/energy_uj ]; }
+# the running kernel loads the xe3lpd DMC (Panther Lake display); the line also names the loaded version
+dmc_loaded() { journalctl -k -b 0 --no-pager 2>/dev/null | sed -n "s|.*Finished loading DMC firmware $DMC_NAME (\(v[0-9.]*\)).*|\1|p" | tail -n1; }
+dmc_system_sha() { sha256sum /usr/lib/firmware/$DMC_NAME.zst 2>/dev/null | cut -d' ' -f1; }
+dmc_override_ok() { [ "$(sha256sum "$DMC_OVERRIDE" 2>/dev/null | cut -d' ' -f1)" = "$DMC_SHA256" ]; }
+# only on machines that use this firmware at all
+dmc_applies() { [ -e /usr/lib/firmware/$DMC_NAME.zst ] || [ -e /usr/lib/firmware/$DMC_NAME ]; }
+DMC_RUNNING="$(dmc_loaded)"
+# the patched mangoapp is only useful for an integrated xe GPU without its own hwmon device
+igpu_without_hwmon() { [ "$(basename "$(readlink /sys/class/drm/card0/device/driver 2>/dev/null)")" = xe ] && ! ls -d /sys/class/drm/card0/device/hwmon >/dev/null 2>&1; }
+mango_bin_ok() { [ -f "$MANGO_BIN" ] && [ "$(sha256sum "$MANGO_BIN" | cut -d' ' -f1)" = "$MANGO_SHA256" ]; }
+mango_matches() { pacman -Q mangohud 2>/dev/null | grep -q "^mangohud $MANGO_FOR-"; }
+user_systemctl() { systemctl --user "$@" 2>/dev/null || true; }   # the desktop user's manager (the script runs as that user)
 have_rapl() { [ -r /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw ] && [ -r /sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw ]; }
 
 # ---- guards -----------------------------------------------------------
@@ -975,6 +1380,23 @@ if have_rapl; then
     say "  package power limit PL1 : MMIO $(( $(cat /sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw) / 1000000 )) W, MSR $(( $(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw) / 1000000 )) W   (the GPU obeys MSR; they should match)"
     if systemctl is-active -q oxp3-tdp-sync.service 2>/dev/null; then say "  TDP sync service oxp3-tdp-sync : active"; else say "  TDP sync service oxp3-tdp-sync : inactive/missing"; fi
 fi
+if have_rapl_pkg; then
+    if findmnt -n -T /sys/class/powercap/intel-rapl:0/energy_uj -o SOURCE 2>/dev/null | grep -q oxp3-rapl; then RAPL_STATE="coarse copy published (overlay can read it)"; else RAPL_STATE="root-only (overlay shows no CPU power)"; fi
+    say "  CPU power for the overlay : $RAPL_STATE"
+fi
+if dmc_applies; then
+    if [ "$(dmc_system_sha)" = "$DMC_SHA256" ]; then DMC_SRC="SteamOS ships v2.20"; elif dmc_override_ok; then DMC_SRC="v2.20 override in place"; else DMC_SRC="SteamOS ships a newer DMC, no override"; fi
+    say "  display firmware DMC : running ${DMC_RUNNING:-?} ($DMC_SRC)   expected v2.20 (newer DMC caps VRR at 70-80 fps)"
+fi
+if systemctl --user is-enabled -q oxp3-audio-route.service 2>/dev/null && systemctl is-enabled -q oxp3-audio-resume.service 2>/dev/null; then
+    say "  speaker route check (boot/resume) : enabled"
+else
+    say "  speaker route check (boot/resume) : missing (speakers may stay silent after boot or resume)"
+fi
+if igpu_without_hwmon; then
+    if [ -f "$MANGO_DROPIN" ] && mango_bin_ok; then MANGO_STATE="patched mangoapp installed$(mango_matches || echo ", but SteamOS has another mangohud version: the stock overlay runs")"; else MANGO_STATE="stock mangoapp (no GPU power/temperature)"; fi
+    say "  GPU power/temperature for the overlay : $MANGO_STATE"
+fi
 if [ "$GYRO_ON" = 1 ]; then
     say "  gyro (experimental) : enabled ; IMU $([ "$IMU_ACTIVE" = 1 ] && echo "visible to the kernel (ACPI override active)" || echo "NOT visible yet (ACPI override not loaded: reboot needed)") ; patched InputPlumber $(gyro_bin_ok && echo present || echo missing)"
 elif [ "$GYRO_WANT" = 1 ]; then
@@ -1038,6 +1460,26 @@ if [ "$MODE" = "--check" ]; then
         same_content "$TDP_SH" "$TDP_SH_CONTENT" || { say "  [diff] TDP sync script missing or differs"; ok=0; }
         same_content "$TDP_UNIT" "$TDP_UNIT_CONTENT" || { say "  [diff] TDP sync unit missing or differs"; ok=0; }
         systemctl is-enabled -q oxp3-tdp-sync.service 2>/dev/null || { say "  [diff] oxp3-tdp-sync.service not enabled"; ok=0; }
+    fi
+    if have_rapl_pkg; then
+        same_content "$RAPL_PY" "$RAPL_PY_CONTENT" || { say "  [diff] CPU power overlay script missing or differs"; ok=0; }
+        same_content "$RAPL_UNIT" "$RAPL_UNIT_CONTENT" || { say "  [diff] CPU power overlay unit missing or differs"; ok=0; }
+        systemctl is-enabled -q oxp3-rapl-overlay.service 2>/dev/null || { say "  [diff] oxp3-rapl-overlay.service not enabled"; ok=0; }
+    fi
+    if igpu_without_hwmon; then
+        mango_bin_ok || { say "  [diff] patched mangoapp missing or differs (apply takes it from the release archive)"; ok=0; }
+        same_content "$MANGO_LAUNCH" "$MANGO_LAUNCH_CONTENT" || { say "  [diff] mangoapp launcher missing or differs"; ok=0; }
+        same_content "$MANGO_DROPIN" "$MANGO_DROPIN_CONTENT" || { say "  [diff] mangoapp user drop-in missing or differs"; ok=0; }
+        mango_matches || say "  [info] SteamOS ships another mangohud than the patched build ($MANGO_FOR): the overlay uses the stock mangoapp"
+    fi
+    same_content "$AUDIO_SH" "$AUDIO_SH_CONTENT" || { say "  [diff] speaker route script missing or differs"; ok=0; }
+    same_content "$AUDIO_UNIT" "$AUDIO_UNIT_CONTENT" || { say "  [diff] speaker route user unit missing or differs"; ok=0; }
+    systemctl --user is-enabled -q oxp3-audio-route.service 2>/dev/null || { say "  [diff] oxp3-audio-route.service (user) not enabled"; ok=0; }
+    same_content "$AUDIO_RESUME_UNIT" "$AUDIO_RESUME_UNIT_CONTENT" || { say "  [diff] speaker route resume unit missing or differs"; ok=0; }
+    systemctl is-enabled -q oxp3-audio-resume.service 2>/dev/null || { say "  [diff] oxp3-audio-resume.service not enabled"; ok=0; }
+    if dmc_applies; then
+        if [ "$(dmc_system_sha)" != "$DMC_SHA256" ] && ! dmc_override_ok; then say "  [diff] SteamOS ships a newer DMC and the v2.20 override is missing"; ok=0; fi
+        if [ -n "$DMC_RUNNING" ] && [ "$DMC_RUNNING" != v2.20 ]; then say "  [diff] the running kernel loaded DMC $DMC_RUNNING (reboot after apply)"; ok=0; fi
     fi
     same_content "$IP_YAML" "$IP_YAML_CONTENT" || { say "  [diff] IP yaml missing or differs"; ok=0; }
     same_content "$IP_CAPMAP" "$IP_CAPMAP_CONTENT" || { say "  [diff] IP capability map missing or differs"; ok=0; }
@@ -1123,6 +1565,14 @@ if [ "$MODE" = "--revert" ]; then
     if [ -f "$BATT_SH" ]; then rm -f "$BATT_SH"; say "  removed $BATT_SH"; fi
     if [ -f "$TDP_UNIT" ]; then sudo systemctl disable --now oxp3-tdp-sync.service 2>/dev/null || true; sudo rm -f "$TDP_UNIT"; sudo systemctl daemon-reload; say "  oxp3-tdp-sync.service stopped and removed (MSR PL1 back to the firmware value)"; fi
     if [ -f "$TDP_SH" ]; then rm -f "$TDP_SH"; say "  removed $TDP_SH"; fi
+    if [ -f "$RAPL_UNIT" ]; then sudo systemctl disable --now oxp3-rapl-overlay.service 2>/dev/null || true; sudo rm -f "$RAPL_UNIT"; sudo systemctl daemon-reload; say "  oxp3-rapl-overlay.service stopped and removed (CPU energy counter root-only again)"; fi
+    if [ -f "$RAPL_PY" ]; then rm -f "$RAPL_PY"; say "  removed $RAPL_PY"; fi
+    if [ -f "$MANGO_DROPIN" ]; then sudo rm -f "$MANGO_DROPIN"; sudo rmdir "$(dirname "$MANGO_DROPIN")" 2>/dev/null || true; user_systemctl daemon-reload; say "  removed $MANGO_DROPIN (stock mangoapp from the next overlay start)"; fi
+    for _f in "$MANGO_LAUNCH" "$MANGO_BIN"; do [ -f "$_f" ] && { rm -f "$_f"; say "  removed $_f"; }; done
+    if [ -f "$DMC_OVERRIDE" ]; then sudo rm -f "$DMC_OVERRIDE"; say "  removed $DMC_OVERRIDE (the packaged DMC loads after the reboot)"; NEED_REBOOT=1; fi
+    if [ -f "$AUDIO_RESUME_UNIT" ]; then sudo systemctl disable oxp3-audio-resume.service 2>/dev/null || true; sudo rm -f "$AUDIO_RESUME_UNIT"; sudo systemctl daemon-reload; say "  removed $AUDIO_RESUME_UNIT"; fi
+    if [ -f "$AUDIO_UNIT" ]; then user_systemctl disable --now oxp3-audio-route.service; rm -f "$AUDIO_UNIT"; user_systemctl daemon-reload; say "  removed $AUDIO_UNIT (no speaker route check any more)"; fi
+    if [ -f "$AUDIO_SH" ]; then rm -f "$AUDIO_SH"; say "  removed $AUDIO_SH"; fi
     if [ -f "$LUA_HDR" ]; then mv -f "$LUA_HDR" "$USER_HOME/oxp3-oled-hdr.lua.disabled"; say "  HDR lua moved to $USER_HOME/oxp3-oled-hdr.lua.disabled"; NEED_RELOGIN=1; fi
     if [ -f "$LUA_NOHDR_BAK" ] && [ ! -f "$LUA_NOHDR" ]; then mkdir -p "$LUA_DIR"; cp -f "$LUA_NOHDR_BAK" "$LUA_NOHDR"; say "  nohdr lua restored (prevents a black screen when HDR is on)"; NEED_RELOGIN=1; fi
     say "revert done. (The Wi-Fi firmware step is not undone: linux-firmware stays installed.)"
@@ -1172,6 +1622,10 @@ else
 fi
 say "   8) $TDP_SH + $TDP_UNIT (MSR package PL1 follows the MMIO PL1)   $(have_rapl && echo "[RAPL OK]" || echo "[SKIPPED: no MSR/MMIO package RAPL]")"
 say "   9) $SPLITLOCK_FILE (split_lock_detect=off) + update-grub, and remove the split-lock reports steamos-log-submitter queued   $(have_split_lock_detect && echo "[CPU has split-lock detection]" || echo "[SKIPPED: the CPU has no split-lock detection]")"
+say "  10) $RAPL_PY + $RAPL_UNIT (CPU/GPU energy for the performance overlay, coarse copies of the counters)   $(have_rapl_pkg && echo "[RAPL OK]" || echo "[SKIPPED: no intel-rapl:0]")"
+say "      + $MANGO_BIN + $MANGO_DROPIN (GPU power/temperature)   $(igpu_without_hwmon && echo "[integrated xe GPU]" || echo "[SKIPPED: the GPU has its own sensors]")"
+say "  11) $DMC_OVERRIDE (display firmware DMC v2.20, VRR)   $(dmc_applies || echo "[SKIPPED: this GPU does not use $DMC_NAME]")$(dmc_applies && { [ "$(dmc_system_sha)" = "$DMC_SHA256" ] && echo "[SteamOS ships v2.20, nothing to do]" || echo "[SteamOS ships a newer DMC]"; })"
+say "  12) $AUDIO_SH + $AUDIO_UNIT + $AUDIO_RESUME_UNIT (speakers after boot/resume when the headphone jack is empty)"
 if [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then read -r -p "  Continue? (y/N) " _ans; case "$_ans" in y|Y) ;; *) say "  cancelled."; exit 0 ;; esac; fi
 sudo -v
 
@@ -1565,6 +2019,126 @@ if [ "$TDP_RESTART" = 1 ] || ! systemctl is-active -q oxp3-tdp-sync.service 2>/d
 ' ';' | sed 's/;$//'))"
 fi
 fi
+
+# e7. CPU power for the overlay (root service; coarse world-readable copy of the package energy counter, no reboot)
+if ! have_rapl_pkg; then
+    say "  [skip] no intel-rapl:0 package zone, skipping the CPU power overlay"
+else
+mkdir -p "$(dirname "$RAPL_PY")"
+if same_content "$RAPL_PY" "$RAPL_PY_CONTENT"; then
+    say "  [skip] $RAPL_PY unchanged"
+else
+    printf '%s\n' "$RAPL_PY_CONTENT" > "$RAPL_PY"; chmod +x "$RAPL_PY"
+    say "  [write] $RAPL_PY"; CHANGED=1; RAPL_RESTART=1
+fi
+if same_content "$RAPL_UNIT" "$RAPL_UNIT_CONTENT"; then
+    say "  [skip] $RAPL_UNIT unchanged"
+else
+    printf '%s\n' "$RAPL_UNIT_CONTENT" | sudo tee "$RAPL_UNIT" >/dev/null
+    sudo systemctl daemon-reload
+    say "  [write] $RAPL_UNIT"; CHANGED=1; RAPL_RESTART=1
+fi
+if ! systemctl is-enabled -q oxp3-rapl-overlay.service 2>/dev/null; then
+    sudo systemctl enable oxp3-rapl-overlay.service >/dev/null 2>&1
+    say "  [enable] oxp3-rapl-overlay.service"; CHANGED=1; RAPL_RESTART=1
+fi
+if [ "$RAPL_RESTART" = 1 ] || ! systemctl is-active -q oxp3-rapl-overlay.service 2>/dev/null; then
+    sudo systemctl restart oxp3-rapl-overlay.service && say "  [restart] oxp3-rapl-overlay.service (the overlay picks it up when it restarts, e.g. after re-entering game mode)"
+fi
+fi
+
+# e8. GPU power/temperature in the overlay: patched mangoapp started through a user drop-in (integrated xe GPU only)
+if ! igpu_without_hwmon; then
+    say "  [skip] the GPU has its own hwmon sensors, the stock overlay shows them"
+else
+MANGO_OK=1; MANGO_RESTART=0
+if mango_bin_ok; then
+    say "  [skip] $MANGO_BIN unchanged"
+elif [ -f "$SCRIPT_DIR/mangoapp-oxp3" ] && [ "$(sha256sum "$SCRIPT_DIR/mangoapp-oxp3" | cut -d' ' -f1)" = "$MANGO_SHA256" ]; then
+    install -m 755 "$SCRIPT_DIR/mangoapp-oxp3" "$MANGO_BIN"; say "  [write] $MANGO_BIN (from the release archive, sha256 verified)"; CHANGED=1; MANGO_RESTART=1
+elif ! command -v curl >/dev/null 2>&1 || ! ip route 2>/dev/null | grep -q '^default'; then
+    say "  [error] the patched mangoapp is not on this machine and there is no network to download it"; MANGO_OK=0
+else
+    say "  [run] downloading the release archive ($PKG_URL) ..."
+    _tmp="$(mktemp -d "${TMPDIR:-/tmp}/oxp3-pkg.XXXXXX")"
+    if curl -fL --retry 3 --progress-bar -o "$_tmp/pkg.tar.gz" "$PKG_URL" \
+        && tar -xzf "$_tmp/pkg.tar.gz" -C "$_tmp" oxp3-fix/mangoapp-oxp3 \
+        && [ "$(sha256sum "$_tmp/oxp3-fix/mangoapp-oxp3" | cut -d' ' -f1)" = "$MANGO_SHA256" ]; then
+        install -m 755 "$_tmp/oxp3-fix/mangoapp-oxp3" "$MANGO_BIN"; say "  [write] $MANGO_BIN (sha256 verified)"; CHANGED=1; MANGO_RESTART=1
+    else
+        say "  [error] download failed or the sha256 does not match"; MANGO_OK=0
+    fi
+    rm -rf "$_tmp"
+fi
+if [ "$MANGO_OK" = 1 ]; then
+    if same_content "$MANGO_LAUNCH" "$MANGO_LAUNCH_CONTENT"; then
+        say "  [skip] $MANGO_LAUNCH unchanged"
+    else
+        printf '%s\n' "$MANGO_LAUNCH_CONTENT" > "$MANGO_LAUNCH"; chmod +x "$MANGO_LAUNCH"
+        say "  [write] $MANGO_LAUNCH"; CHANGED=1; MANGO_RESTART=1
+    fi
+    if sudo_put "$MANGO_DROPIN" "$MANGO_DROPIN_CONTENT"; then CHANGED=1; MANGO_RESTART=1; fi
+    if [ "$MANGO_RESTART" = 1 ]; then
+        user_systemctl daemon-reload
+        if systemctl --user is-active -q gamescope-mangoapp.service 2>/dev/null; then
+            user_systemctl restart gamescope-mangoapp.service; say "  [restart] the performance overlay (mangoapp)"
+        else
+            say "  the overlay uses the patched build from the next game-mode session"
+        fi
+    fi
+    mango_matches || say "  [info] SteamOS ships another mangohud than the patched build ($MANGO_FOR): the launcher starts the stock mangoapp until a matching build is released"
+fi
+fi
+
+# e9. display firmware: keep DMC v2.20 (newer DMC caps VRR at 70-80 fps). xe is not in the initramfs, so firmware/updates
+#     is read at boot; a SteamOS update resets /usr, re-run the script afterwards.
+if ! dmc_applies; then
+    say "  [skip] this GPU does not use $DMC_NAME"
+elif [ "$(dmc_system_sha)" = "$DMC_SHA256" ]; then
+    if [ -f "$DMC_OVERRIDE" ]; then sudo rm -f "$DMC_OVERRIDE"; say "  [remove] $DMC_OVERRIDE (SteamOS ships v2.20 itself)"; CHANGED=1; fi
+    say "  [skip] SteamOS ships DMC v2.20, no override needed"
+elif dmc_override_ok; then
+    say "  [skip] $DMC_OVERRIDE unchanged"
+else
+    _tmp="$(mktemp "${TMPDIR:-/tmp}/oxp3-dmc.XXXXXX")"
+    printf '%s' "$DMC_B64" | base64 -d > "$_tmp"
+    if [ "$(sha256sum "$_tmp" | cut -d' ' -f1)" = "$DMC_SHA256" ] && sudo install -D -m 644 "$_tmp" "$DMC_OVERRIDE"; then
+        say "  [write] $DMC_OVERRIDE (DMC v2.20)"; CHANGED=1
+    else
+        say "  [error] could not write the DMC v2.20 override"
+    fi
+    rm -f "$_tmp"
+fi
+if dmc_applies && [ -n "$DMC_RUNNING" ] && [ "$DMC_RUNNING" != v2.20 ] && { dmc_override_ok || [ "$(dmc_system_sha)" = "$DMC_SHA256" ]; }; then
+    say "  DMC $DMC_RUNNING is loaded right now: v2.20 takes over after the reboot"; NEED_REBOOT=1
+fi
+
+# e10. speaker route check: user unit at session start, re-run by a root unit after every resume; it only switches the
+#      card profile when the headphone jack is empty but the Headphones profile is active
+mkdir -p "$(dirname "$AUDIO_SH")" "$(dirname "$AUDIO_UNIT")"
+AUDIO_CHANGED=0
+if same_content "$AUDIO_SH" "$AUDIO_SH_CONTENT"; then
+    say "  [skip] $AUDIO_SH unchanged"
+else
+    printf '%s\n' "$AUDIO_SH_CONTENT" > "$AUDIO_SH"; chmod +x "$AUDIO_SH"
+    say "  [write] $AUDIO_SH"; CHANGED=1; AUDIO_CHANGED=1
+fi
+if same_content "$AUDIO_UNIT" "$AUDIO_UNIT_CONTENT"; then
+    say "  [skip] $AUDIO_UNIT unchanged"
+else
+    printf '%s\n' "$AUDIO_UNIT_CONTENT" > "$AUDIO_UNIT"
+    say "  [write] $AUDIO_UNIT"; CHANGED=1; AUDIO_CHANGED=1
+fi
+[ "$AUDIO_CHANGED" = 1 ] && user_systemctl daemon-reload
+if ! systemctl --user is-enabled -q oxp3-audio-route.service 2>/dev/null; then
+    user_systemctl enable oxp3-audio-route.service; say "  [enable] oxp3-audio-route.service (user)"; CHANGED=1
+fi
+if sudo_put "$AUDIO_RESUME_UNIT" "$AUDIO_RESUME_UNIT_CONTENT"; then sudo systemctl daemon-reload; CHANGED=1; fi
+if ! systemctl is-enabled -q oxp3-audio-resume.service 2>/dev/null; then
+    sudo systemctl enable oxp3-audio-resume.service; say "  [enable] oxp3-audio-resume.service"; CHANGED=1
+fi
+# check right away too, the current session may have started with the wrong profile
+[ "$AUDIO_CHANGED" = 1 ] && user_systemctl start --no-block oxp3-audio-route.service
 
 # f. summary
 hdr "Summary"

@@ -7,3 +7,4 @@
 *.md text eol=lf
 gyro/*.patch -text
 *.dsl text eol=lf
+*.patch -text

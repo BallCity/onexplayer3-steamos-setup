@@ -1,0 +1,163 @@
+From 2c4851402840f7cfbd1b2cdc9dcaa550cd43af75 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 15 Oct 2026 17:02:57 +0900
+Subject: [PATCH 1/2] gpu_fdinfo: power and temperature for integrated xe GPUs
+ without hwmon
+
+---
+ src/gpu_fdinfo.cpp | 59 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/gpu_fdinfo.h   |  8 +++++++
+ 2 files changed, 67 insertions(+)
+
+diff --git a/src/gpu_fdinfo.cpp b/src/gpu_fdinfo.cpp
+index 0fdd99e..90065c1 100644
+--- a/src/gpu_fdinfo.cpp
++++ b/src/gpu_fdinfo.cpp
+@@ -1,4 +1,5 @@
+ #include "gpu_fdinfo.h"
++#include "file_utils.h"
+ 
+ #ifndef TEST_ONLY
+ #include "hud_elements.h"
+@@ -182,6 +183,9 @@ void GPU_fdinfo::find_hwmon_sensors()
+     else
+         hwmon = find_hwmon_dir();
+ 
++    if (hwmon.empty() && module == "xe" && find_igpu_sensors())
++        return;
++
+     if (hwmon.empty()) {
+         SPDLOG_DEBUG("hwmon: failed to find hwmon directory");
+         return;
+@@ -282,6 +286,46 @@ std::string GPU_fdinfo::find_hwmon_sensor_dir(std::string name) {
+     return "";
+ }
+ 
++bool GPU_fdinfo::find_igpu_sensors()
++{
++    // RAPL PP1 is the graphics power plane on Intel client CPUs; Linux names that zone "uncore".
++    const std::string pp1 = "/sys/class/powercap/intel-rapl:0:1";
++    std::string pp1_name = read_line(pp1 + "/name");
++    if (pp1_name == "uncore" && access((pp1 + "/energy_uj").c_str(), R_OK) == 0) {
++        auto& e = hwmon_sensors["energy"];
++        e.filename = pp1 + "/energy_uj";
++        e.stream.open(e.filename);
++        igpu_fallback = e.stream.good();
++    }
++
++    // the integrated GPU sits on the CPU package: use the coretemp package sensor
++    for (const auto& entry : fs::directory_iterator("/sys/class/hwmon")) {
++        std::string dir = entry.path().string();
++        if (read_line(dir + "/name") != "coretemp")
++            continue;
++        for (const auto& f : fs::directory_iterator(dir)) {
++            std::string label = f.path().string();
++            if (label.size() < 6 || label.substr(label.size() - 6) != "_label")
++                continue;
++            if (read_line(label).rfind("Package id", 0) != 0)
++                continue;
++            auto& t = hwmon_sensors["temp"];
++            t.filename = label.substr(0, label.size() - 6) + "_input";
++            t.stream.open(t.filename);
++            if (t.stream.good())
++                igpu_fallback = true;
++            break;
++        }
++        break;
++    }
++
++    if (igpu_fallback)
++        SPDLOG_INFO("xe: integrated GPU without hwmon, power from {}, temperature from {}",
++                    hwmon_sensors["energy"].filename.empty() ? "nowhere" : hwmon_sensors["energy"].filename,
++                    hwmon_sensors["temp"].filename.empty() ? "nowhere" : hwmon_sensors["temp"].filename);
++    return igpu_fallback;
++}
++
+ void GPU_fdinfo::get_current_hwmon_readings()
+ {
+     for (auto& hs : hwmon_sensors) {
+@@ -305,6 +349,21 @@ void GPU_fdinfo::get_current_hwmon_readings()
+ 
+ float GPU_fdinfo::get_power_usage()
+ {
++    if (igpu_fallback) {
++        // the energy counter may be refreshed less often than we poll it: use the real time between increases
++        uint64_t e = hwmon_sensors["energy"].val;
++        uint64_t t = os_time_get_nano();
++        if (igpu_last_energy == 0 || e < igpu_last_energy) {
++            igpu_last_energy = e;
++            igpu_last_time = t;
++        } else if (e > igpu_last_energy && t > igpu_last_time) {
++            igpu_power = (e - igpu_last_energy) / 1e6f / ((t - igpu_last_time) / 1e9f);
++            igpu_last_energy = e;
++            igpu_last_time = t;
++        }
++        return igpu_power;
++    }
++
+     if (!hwmon_sensors["power"].filename.empty())
+         return static_cast<float>(hwmon_sensors["power"].val) / 1'000'000;
+ 
+diff --git a/src/gpu_fdinfo.h b/src/gpu_fdinfo.h
+index 97e62e5..f5eada9 100644
+--- a/src/gpu_fdinfo.h
++++ b/src/gpu_fdinfo.h
+@@ -91,6 +91,14 @@ private:
+     float get_power_usage();
+     float last_power = 0;
+ 
++    // Integrated xe GPUs have no hwmon device: use the RAPL graphics plane (PP1, "uncore") for the power and the CPU
++    // package temperature (same die) for the temperature.
++    bool igpu_fallback = false;
++    uint64_t igpu_last_energy = 0;
++    uint64_t igpu_last_time = 0;
++    float igpu_power = 0;
++    bool find_igpu_sensors();
++
+     std::ifstream gpu_clock_stream;
+     void find_i915_gt_dir();
+     void find_xe_gt_dir();
+-- 
+2.52.0.windows.1
+
+
+From 90b016ae5cd5f350ba93166c8d9772d841fb6aad Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 16 Oct 2026 21:11:17 +0900
+Subject: [PATCH 2/2] mangoapp: exit at once on an X error instead of hanging
+ in exit()
+
+---
+ src/app/main.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/app/main.cpp b/src/app/main.cpp
+index 19c465f..9c2490b 100644
+--- a/src/app/main.cpp
++++ b/src/app/main.cpp
+@@ -317,9 +317,22 @@ static bool render(GLFWwindow* window, overlay_params& real_params) {
+     return window_size_changed;
+ }
+ 
++// Xlib's default error handler calls exit(), and exit() can hang here while static destructors wait for the
++// worker threads, leaving a mangoapp that runs but never draws (seen when it starts before gamescope is ready at
++// boot). Exit immediately instead, so systemd restarts it.
++static int x_error_exit(Display* dpy, XErrorEvent* ev)
++{
++    char text[256];
++    XGetErrorText(dpy, ev->error_code, text, sizeof(text));
++    fprintf(stderr, "mangoapp: X error \"%s\" (request %d), exiting so the overlay gets restarted\n", text, ev->request_code);
++    fflush(stderr);
++    _exit(1);
++}
++
+ int main(int, char**)
+ {
+     XInitThreads();
++    XSetErrorHandler(x_error_exit);
+ 
+     // Setup window
+     glfwSetErrorCallback(glfw_error_callback);
+-- 
+2.52.0.windows.1
+
