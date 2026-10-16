@@ -79,6 +79,8 @@ TESTED_KERNEL_PREFIX="7.2.0-valve1"
 #        temperature from the package sensor, because the integrated xe GPU has no hwmon device
 #    11) display firmware DMC v2.20 - newer DMC releases (v2.36 in upstream linux-firmware, which SteamOS ships from
 #        20261015.1000 on) cap the frame rate at 70-80 fps with VRR; v2.20 goes into /usr/lib/firmware/updates
+#    12) speakers silent after boot or resume - the jack detection briefly reports headphones and PipeWire keeps the
+#        Headphones profile; a user unit re-selects the Speaker profile when the jack is empty (only on that mismatch)
 # Usage:
 #   ./oxp3-apply-fixes.sh                apply (asks sudo password, prints the plan and confirms)
 #   ./oxp3-apply-fixes.sh --check        check only, changes nothing, needs no sudo (covers every fix, gyro included when enabled)
@@ -142,6 +144,10 @@ MANGO_SHA256="beaae37cb2defa1af0cf5b7f6a0eed31fc7d4796a58743764fd74f20b418e246"
 DMC_NAME=i915/xe3lpd_dmc.bin                                 # the Panther Lake display controller firmware
 DMC_OVERRIDE=/usr/lib/firmware/updates/$DMC_NAME.zst         # firmware/updates takes precedence over the packaged file
 DMC_SHA256="150eaa60a776e489f69e6f334d4c12216c0d686f3a53ac2228d0a6ce48f8add9"   # v2.20 (.zst) from linux-firmware-neptune 20260910
+AUDIO_SH="$USER_HOME/oxp3-fix/oxp3-audio-route.sh"          # in /home, survives updates
+AUDIO_UNIT="$USER_HOME/.config/systemd/user/oxp3-audio-route.service"   # user unit, in /home too
+AUDIO_RESUME_UNIT=/etc/systemd/system/oxp3-audio-resume.service  # runs the user unit again after every resume
+AUDIO_USER="$(stat -c %U "$USER_HOME" 2>/dev/null || id -un)"
 IP_YAML=/etc/inputplumber/devices.d/50-onexplayer_3.yaml
 IP_CAPMAP=/etc/inputplumber/capability_maps.d/onexplayer_type3.yaml   # id oxp3: Home key -> Guide   # InputPlumber 0.78 override dir is devices.d
 # experimental gyro (step 7)
@@ -876,6 +882,85 @@ MANGO_LAUNCH_CONTENT="${MANGO_LAUNCH_CONTENT//__MANGO_BIN__/$MANGO_BIN}"
 MANGO_LAUNCH_CONTENT="${MANGO_LAUNCH_CONTENT//__MANGO_FOR__/$MANGO_FOR}"
 MANGO_DROPIN_CONTENT="${MANGO_DROPIN_CONTENT//__MANGO_LAUNCH__/$MANGO_LAUNCH}"
 
+# ---- speaker route check (step 12) contents ---------------------------
+AUDIO_SH_CONTENT=$(cat <<'EOT'
+#!/bin/sh
+# oxp3-audio-route.sh - the speakers stay silent after a boot or resume although nothing is plugged into the headphone jack.
+#
+# The jack detection reports "plugged" for a moment while the codec (Realtek ALC245) powers up. PipeWire picks the
+# Headphones card profile from that and misses the later "unplugged" event, so the speaker amplifier stays switched off
+# until WirePlumber is restarted. This check runs a few times shortly after the session starts and after every resume
+# (user unit oxp3-audio-route.service, started by the fix pack's resume hook). It only acts on a mismatch: the ALSA
+# "Headphone Jack" control is off, but the active profile is a Headphones profile. It then selects the matching Speaker
+# profile, or restarts WirePlumber when that does not take. A plugged-in headset is never touched.
+log() { echo "oxp3-audio-route: $*"; }
+
+check() {
+    pactl list cards 2>/dev/null | awk '
+        /^Card #/ { if (name != "") print name "\t" alsa "\t" active "\t" spk; name = ""; alsa = ""; active = ""; spk = ""; inprof = 0 }
+        /^\tName: / { name = $2 }
+        /api\.alsa\.card = / { v = $3; gsub(/"/, "", v); alsa = v }
+        /^\tProfiles:/ { inprof = 1; next }
+        /^\tActive Profile: / { inprof = 0; sub(/^\tActive Profile: /, ""); active = $0 }
+        inprof && /^\t\t/ { p = $0; sub(/^\t\t/, "", p); sub(/: .*/, "", p); if (p ~ /Speaker/ && p !~ /Headphones/) spk = p }
+        /^\t[A-Z]/ && !/^\tProfiles:/ { inprof = 0 }
+        END { if (name != "") print name "\t" alsa "\t" active "\t" spk }' |
+    while IFS="$(printf '\t')" read -r card alsa active spk; do
+        case "$active" in *Headphones*) ;; *) continue ;; esac
+        [ -n "$spk" ] && [ -n "$alsa" ] || continue
+        amixer -c "$alsa" cget iface=CARD,name='Headphone Jack' 2>/dev/null | grep -q ': values=off' || continue
+        log "nothing in the headphone jack, but $card uses \"$active\": switching to \"$spk\""
+        pactl set-card-profile "$card" "$spk"
+        sleep 2
+        if pactl list cards 2>/dev/null | grep -q "Active Profile: $spk\$"; then
+            log "speaker profile active"
+        else
+            log "the profile did not change, restarting WirePlumber"
+            systemctl --user restart wireplumber.service
+        fi
+    done
+}
+
+# the jack settles within a few seconds; check a few times so a late wrong selection is caught too
+for d in 3 7 20; do
+    sleep "$d"
+    check
+done
+EOT
+)
+
+AUDIO_UNIT_CONTENT=$(cat <<'EOT'
+[Unit]
+Description=OXP3: select the speakers when the headphone jack is empty (jack misdetection at boot/resume)
+# see the header of __AUDIO_SH__ ; revert: ./oxp3-apply-fixes.sh --revert
+After=wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/bin/sh __AUDIO_SH__
+
+[Install]
+WantedBy=graphical-session.target
+EOT
+)
+AUDIO_UNIT_CONTENT="${AUDIO_UNIT_CONTENT//__AUDIO_SH__/$AUDIO_SH}"
+
+AUDIO_RESUME_UNIT_CONTENT=$(cat <<'EOT'
+[Unit]
+Description=OXP3: re-check the speaker route after resume (starts the user unit oxp3-audio-route.service)
+# revert: systemctl disable --now oxp3-audio-resume.service
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/bin/systemctl --user -M __AUDIO_USER__@ start --no-block oxp3-audio-route.service
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+EOT
+)
+AUDIO_RESUME_UNIT_CONTENT="${AUDIO_RESUME_UNIT_CONTENT//__AUDIO_USER__/$AUDIO_USER}"
+
 # ---- experimental gyro (step 7) contents ------------------------------
 GRUB_IMU_CONTENT=$(cat <<'EOT'
 # ACPI table override for the gyroscope (experimental): renames the IMU node so the kernel's bmi270 driver binds.
@@ -1295,6 +1380,11 @@ if dmc_applies; then
     if [ "$(dmc_system_sha)" = "$DMC_SHA256" ]; then DMC_SRC="SteamOS ships v2.20"; elif dmc_override_ok; then DMC_SRC="v2.20 override in place"; else DMC_SRC="SteamOS ships a newer DMC, no override"; fi
     say "  display firmware DMC : running ${DMC_RUNNING:-?} ($DMC_SRC)   expected v2.20 (newer DMC caps VRR at 70-80 fps)"
 fi
+if systemctl --user is-enabled -q oxp3-audio-route.service 2>/dev/null && systemctl is-enabled -q oxp3-audio-resume.service 2>/dev/null; then
+    say "  speaker route check (boot/resume) : enabled"
+else
+    say "  speaker route check (boot/resume) : missing (speakers may stay silent after boot or resume)"
+fi
 if igpu_without_hwmon; then
     if [ -f "$MANGO_DROPIN" ] && mango_bin_ok; then MANGO_STATE="patched mangoapp installed$(mango_matches || echo ", but SteamOS has another mangohud version: the stock overlay runs")"; else MANGO_STATE="stock mangoapp (no GPU power/temperature)"; fi
     say "  GPU power/temperature for the overlay : $MANGO_STATE"
@@ -1374,6 +1464,11 @@ if [ "$MODE" = "--check" ]; then
         same_content "$MANGO_DROPIN" "$MANGO_DROPIN_CONTENT" || { say "  [diff] mangoapp user drop-in missing or differs"; ok=0; }
         mango_matches || say "  [info] SteamOS ships another mangohud than the patched build ($MANGO_FOR): the overlay uses the stock mangoapp"
     fi
+    same_content "$AUDIO_SH" "$AUDIO_SH_CONTENT" || { say "  [diff] speaker route script missing or differs"; ok=0; }
+    same_content "$AUDIO_UNIT" "$AUDIO_UNIT_CONTENT" || { say "  [diff] speaker route user unit missing or differs"; ok=0; }
+    systemctl --user is-enabled -q oxp3-audio-route.service 2>/dev/null || { say "  [diff] oxp3-audio-route.service (user) not enabled"; ok=0; }
+    same_content "$AUDIO_RESUME_UNIT" "$AUDIO_RESUME_UNIT_CONTENT" || { say "  [diff] speaker route resume unit missing or differs"; ok=0; }
+    systemctl is-enabled -q oxp3-audio-resume.service 2>/dev/null || { say "  [diff] oxp3-audio-resume.service not enabled"; ok=0; }
     if dmc_applies; then
         if [ "$(dmc_system_sha)" != "$DMC_SHA256" ] && ! dmc_override_ok; then say "  [diff] SteamOS ships a newer DMC and the v2.20 override is missing"; ok=0; fi
         if [ -n "$DMC_RUNNING" ] && [ "$DMC_RUNNING" != v2.20 ]; then say "  [diff] the running kernel loaded DMC $DMC_RUNNING (reboot after apply)"; ok=0; fi
@@ -1467,6 +1562,9 @@ if [ "$MODE" = "--revert" ]; then
     if [ -f "$MANGO_DROPIN" ]; then sudo rm -f "$MANGO_DROPIN"; sudo rmdir "$(dirname "$MANGO_DROPIN")" 2>/dev/null || true; user_systemctl daemon-reload; say "  removed $MANGO_DROPIN (stock mangoapp from the next overlay start)"; fi
     for _f in "$MANGO_LAUNCH" "$MANGO_BIN"; do [ -f "$_f" ] && { rm -f "$_f"; say "  removed $_f"; }; done
     if [ -f "$DMC_OVERRIDE" ]; then sudo rm -f "$DMC_OVERRIDE"; say "  removed $DMC_OVERRIDE (the packaged DMC loads after the reboot)"; NEED_REBOOT=1; fi
+    if [ -f "$AUDIO_RESUME_UNIT" ]; then sudo systemctl disable oxp3-audio-resume.service 2>/dev/null || true; sudo rm -f "$AUDIO_RESUME_UNIT"; sudo systemctl daemon-reload; say "  removed $AUDIO_RESUME_UNIT"; fi
+    if [ -f "$AUDIO_UNIT" ]; then user_systemctl disable --now oxp3-audio-route.service; rm -f "$AUDIO_UNIT"; user_systemctl daemon-reload; say "  removed $AUDIO_UNIT (no speaker route check any more)"; fi
+    if [ -f "$AUDIO_SH" ]; then rm -f "$AUDIO_SH"; say "  removed $AUDIO_SH"; fi
     if [ -f "$LUA_HDR" ]; then mv -f "$LUA_HDR" "$USER_HOME/oxp3-oled-hdr.lua.disabled"; say "  HDR lua moved to $USER_HOME/oxp3-oled-hdr.lua.disabled"; NEED_RELOGIN=1; fi
     if [ -f "$LUA_NOHDR_BAK" ] && [ ! -f "$LUA_NOHDR" ]; then mkdir -p "$LUA_DIR"; cp -f "$LUA_NOHDR_BAK" "$LUA_NOHDR"; say "  nohdr lua restored (prevents a black screen when HDR is on)"; NEED_RELOGIN=1; fi
     say "revert done. (The Wi-Fi firmware step is not undone: linux-firmware stays installed.)"
@@ -1519,6 +1617,7 @@ say "   9) $SPLITLOCK_FILE (split_lock_detect=off) + update-grub, and remove the
 say "  10) $RAPL_PY + $RAPL_UNIT (CPU/GPU energy for the performance overlay, coarse copies of the counters)   $(have_rapl_pkg && echo "[RAPL OK]" || echo "[SKIPPED: no intel-rapl:0]")"
 say "      + $MANGO_BIN + $MANGO_DROPIN (GPU power/temperature)   $(igpu_without_hwmon && echo "[integrated xe GPU]" || echo "[SKIPPED: the GPU has its own sensors]")"
 say "  11) $DMC_OVERRIDE (display firmware DMC v2.20, VRR)   $(dmc_applies || echo "[SKIPPED: this GPU does not use $DMC_NAME]")$(dmc_applies && { [ "$(dmc_system_sha)" = "$DMC_SHA256" ] && echo "[SteamOS ships v2.20, nothing to do]" || echo "[SteamOS ships a newer DMC]"; })"
+say "  12) $AUDIO_SH + $AUDIO_UNIT + $AUDIO_RESUME_UNIT (speakers after boot/resume when the headphone jack is empty)"
 if [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then read -r -p "  Continue? (y/N) " _ans; case "$_ans" in y|Y) ;; *) say "  cancelled."; exit 0 ;; esac; fi
 sudo -v
 
@@ -2005,6 +2104,33 @@ fi
 if dmc_applies && [ -n "$DMC_RUNNING" ] && [ "$DMC_RUNNING" != v2.20 ] && { dmc_override_ok || [ "$(dmc_system_sha)" = "$DMC_SHA256" ]; }; then
     say "  DMC $DMC_RUNNING is loaded right now: v2.20 takes over after the reboot"; NEED_REBOOT=1
 fi
+
+# e10. speaker route check: user unit at session start, re-run by a root unit after every resume; it only switches the
+#      card profile when the headphone jack is empty but the Headphones profile is active
+mkdir -p "$(dirname "$AUDIO_SH")" "$(dirname "$AUDIO_UNIT")"
+AUDIO_CHANGED=0
+if same_content "$AUDIO_SH" "$AUDIO_SH_CONTENT"; then
+    say "  [skip] $AUDIO_SH unchanged"
+else
+    printf '%s\n' "$AUDIO_SH_CONTENT" > "$AUDIO_SH"; chmod +x "$AUDIO_SH"
+    say "  [write] $AUDIO_SH"; CHANGED=1; AUDIO_CHANGED=1
+fi
+if same_content "$AUDIO_UNIT" "$AUDIO_UNIT_CONTENT"; then
+    say "  [skip] $AUDIO_UNIT unchanged"
+else
+    printf '%s\n' "$AUDIO_UNIT_CONTENT" > "$AUDIO_UNIT"
+    say "  [write] $AUDIO_UNIT"; CHANGED=1; AUDIO_CHANGED=1
+fi
+[ "$AUDIO_CHANGED" = 1 ] && user_systemctl daemon-reload
+if ! systemctl --user is-enabled -q oxp3-audio-route.service 2>/dev/null; then
+    user_systemctl enable oxp3-audio-route.service; say "  [enable] oxp3-audio-route.service (user)"; CHANGED=1
+fi
+if sudo_put "$AUDIO_RESUME_UNIT" "$AUDIO_RESUME_UNIT_CONTENT"; then sudo systemctl daemon-reload; CHANGED=1; fi
+if ! systemctl is-enabled -q oxp3-audio-resume.service 2>/dev/null; then
+    sudo systemctl enable oxp3-audio-resume.service; say "  [enable] oxp3-audio-resume.service"; CHANGED=1
+fi
+# check right away too, the current session may have started with the wrong profile
+[ "$AUDIO_CHANGED" = 1 ] && user_systemctl start --no-block oxp3-audio-route.service
 
 # f. summary
 hdr "Summary"
