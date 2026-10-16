@@ -73,8 +73,10 @@ TESTED_KERNEL_PREFIX="7.2.0-valve1"
 #     7) [EXPERIMENTAL, opt-in] gyroscope - ACPI override so the kernel sees the BMI260 + patched InputPlumber (Steam Deck gyro)
 #     8) TDP sync service - the MSR package PL1 (obeyed by the GPU) follows the MMIO PL1 that TDP tools set
 #     9) kernel param split_lock_detect=off - stops the split-lock report flood (journal + steamos-log-submitter queue)
-#    10) CPU power for the performance overlay - a root service publishes a coarse (0.5 s, 10 mJ) world-readable copy of the
-#        package energy counter, which the kernel keeps root-only (CVE-2020-8694), so the overlay shows the CPU power
+#    10) CPU and GPU power/temperature in the performance overlay - a root service publishes coarse (0.5 s, 10 mJ) world-
+#        readable copies of the package and GPU (PP1) energy counters, which the kernel keeps root-only (CVE-2020-8694), and
+#        a patched mangoapp (mangoapp/ in the repo, binary in the release archive) reads GPU power from PP1 and the GPU
+#        temperature from the package sensor, because the integrated xe GPU has no hwmon device
 # Usage:
 #   ./oxp3-apply-fixes.sh                apply (asks sudo password, prints the plan and confirms)
 #   ./oxp3-apply-fixes.sh --check        check only, changes nothing, needs no sudo (covers every fix, gyro included when enabled)
@@ -130,6 +132,11 @@ TDP_SH="$USER_HOME/oxp3-fix/oxp3-tdp-sync.sh"                # in /home, survive
 TDP_UNIT=/etc/systemd/system/oxp3-tdp-sync.service
 RAPL_PY="$USER_HOME/oxp3-fix/oxp3-rapl-overlay.py"          # in /home, survives updates
 RAPL_UNIT=/etc/systemd/system/oxp3-rapl-overlay.service
+MANGO_BIN="$USER_HOME/oxp3-fix/mangoapp-oxp3"               # patched mangoapp (source: mangoapp/ in the repo)
+MANGO_LAUNCH="$USER_HOME/oxp3-fix/oxp3-mangoapp-launch.sh"   # starts MANGO_BIN, or the stock mangoapp when it cannot run
+MANGO_DROPIN=/etc/systemd/user/gamescope-mangoapp.service.d/oxp3-mangoapp.conf
+MANGO_FOR="0.8.3.rc1.r24.g33c2c7dd"                         # the SteamOS mangohud package the patch was built from
+MANGO_SHA256="c6297cae4fca9bec96470148ce43ae456977aee10d54ca1ff66bbbc60ff0abc0"
 IP_YAML=/etc/inputplumber/devices.d/50-onexplayer_3.yaml
 IP_CAPMAP=/etc/inputplumber/capability_maps.d/onexplayer_type3.yaml   # id oxp3: Home key -> Guide   # InputPlumber 0.78 override dir is devices.d
 # experimental gyro (step 7)
@@ -145,7 +152,8 @@ GRUB_IMU_FILE=/etc/default/grub.d/oxp3-imu.cfg
 GYRO_BIOS="5.09"                                             # the ACPI override is a patched copy of this BIOS's SSDT26
 GYRO_IP_SERIES="0.78"                                        # the patched build is InputPlumber 0.78.0
 GYRO_BIN_SHA256="1107d95c34863c7865cac64183673135098d77265a32763c22fc7efbc1893aa3"
-GYRO_PKG_URL="https://github.com/HHHHanasak1/onexplayer3-steamos-setup/releases/download/20261015/oxp3-fix.tar.gz"   # release archive holding the binary
+PKG_URL="https://github.com/HHHHanasak1/onexplayer3-steamos-setup/releases/download/20261016/oxp3-fix.tar.gz"
+GYRO_PKG_URL="$PKG_URL"   # release archive holding the binary
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"                  # the extracted release archive, if the script came from it
 ACPI_IMG_SHA256="0e9b716e65978ac7365fda6fddf476a18b352a2d1ed98f4f30c8d3f8558b2113"
 ACPI_IMG_OLD_SHA256="2d1a0a88e4cfe694cd4edc9b0d0a5e28f7f3f5bb9ccdcf7cbf1d5d01a02d42ad"   # earlier build of the same table (long cpio member name)
@@ -706,93 +714,111 @@ TDP_UNIT_CONTENT="${TDP_UNIT_CONTENT//__TDP_SH__/$TDP_SH}"
 # ---- CPU power for the overlay (step 10) ------------------------------
 RAPL_PY_CONTENT=$(cat <<'EOT'
 #!/usr/bin/python3
-# oxp3-rapl-overlay.py - let the performance overlay show the CPU package power without exposing the raw RAPL counter.
+# oxp3-rapl-overlay.py - let the performance overlay show CPU and GPU power without exposing the raw RAPL counters.
 #
-# The overlay (mangoapp, MangoHud) runs as the desktop user and reads /sys/class/powercap/intel-rapl:0/energy_uj, which
-# the kernel keeps root-only since the PLATYPUS power side channel (CVE-2020-8694): with the raw counter (updated about
-# every millisecond, microjoule resolution) an unprivileged program can sample the energy of short code paths. So the
-# overlay shows no CPU power ("Failed to initialize CPU power data" in the journal).
+# The overlay (mangoapp, MangoHud) runs as the desktop user and reads RAPL energy counters, which the kernel keeps
+# root-only since the PLATYPUS power side channel (CVE-2020-8694): with a raw counter (updated about every millisecond,
+# microjoule resolution) an unprivileged program can sample the energy of short code paths. So the overlay shows no
+# CPU power ("Failed to initialize CPU power data" in the journal).
 #
-# Fix: a root service opens the real counter once, then bind-mounts a world-readable copy over the attribute and
-# refreshes it twice a second, rounded down to 10 mJ. That is plenty for a power reading over the overlay's
-# 500 ms window, and useless for the side channel, which needs thousands of samples per second. Only the package
-# counter of the MSR zone is covered; every other RAPL counter stays root-only. The copy is a monotonic counter that
-# never wraps. Run as a root service (see the fix pack). --stop removes the overlay (systemctl stop does it too).
+# Fix: a root service opens the real counters once, then bind-mounts world-readable copies over the attributes and
+# refreshes them twice a second, rounded down to 10 mJ. That is plenty for a power reading over the overlay's 500 ms
+# window, and useless for the side channel, which needs thousands of samples per second. Covered zones:
+#   intel-rapl:0    package-0  CPU power (read by stock MangoHud)
+#   intel-rapl:0:1  uncore     RAPL PP1, the graphics power plane (read by the patched mangoapp for the integrated GPU)
+# Every other RAPL counter stays root-only. The copies are monotonic counters that never wrap.
+# Run as a root service (see the fix pack). --stop removes the overlays (systemctl stop does it too).
 import os
 import subprocess
 import sys
 import time
 
-REAL = "/sys/class/powercap/intel-rapl:0/energy_uj"
-RANGE = "/sys/class/powercap/intel-rapl:0/max_energy_range_uj"
+BASE = "/sys/class/powercap"
+ZONES = [("intel-rapl:0", "package-0"), ("intel-rapl:0:1", "uncore")]
 RUNDIR = "/run/oxp3-rapl"
-COPY = RUNDIR + "/energy_uj"
 PERIOD = 0.5         # s between refreshes
-QUANTUM = 10000      # uJ (10 mJ) resolution of the copy
+QUANTUM = 10000      # uJ (10 mJ) resolution of the copies
 WIDTH = 20           # fixed width, so every refresh is one same-length in-place write
 
 
-def mounted() -> bool:
-    return subprocess.run(["mountpoint", "-q", REAL]).returncode == 0
+def real_path(zone: str) -> str:
+    return f"{BASE}/{zone}/energy_uj"
 
 
-def unmount() -> None:
+def mounted(path: str) -> bool:
+    return subprocess.run(["mountpoint", "-q", path]).returncode == 0
+
+
+def unmount(path: str) -> None:
     # lazy: the overlay keeps the file open, so a plain umount fails with "target is busy". Detaching is enough: a reader
     # holding the old copy keeps reading the same tmpfs file, which the next run keeps updating.
     for _ in range(10):
-        if not mounted():
+        if not mounted(path):
             return
-        subprocess.run(["umount", "-l", REAL], check=False)
+        subprocess.run(["umount", "-l", path], check=False)
 
 
 if len(sys.argv) > 1 and sys.argv[1] == "--stop":
-    unmount()
+    for zone, _ in ZONES:
+        unmount(real_path(zone))
     sys.exit(0)
-
-if not os.path.exists(REAL):
-    print("no intel-rapl:0 package zone, nothing to do")
-    sys.exit(0)
-
-unmount()                                   # a stale overlay from an earlier run would hide the real counter
-real = os.open(REAL, os.O_RDONLY)           # kept open: after the bind mount this fd is the only way to the real file
-with open(RANGE) as f:
-    wrap = int(f.read()) + 1
-
-
-def read_real() -> int:
-    return int(os.pread(real, 64, 0))
-
 
 os.makedirs(RUNDIR, mode=0o755, exist_ok=True)
-fd = os.open(COPY, os.O_RDWR | os.O_CREAT, 0o444)   # same file (inode) across restarts, see unmount()
-os.fchmod(fd, 0o444)
-try:
-    total = int(os.pread(fd, 64, 0) or b"0")      # continue the published count, so a reader never sees it go back
-except ValueError:
-    total = 0
+zones = []
+for zone, name in ZONES:
+    path = real_path(zone)
+    try:
+        with open(f"{BASE}/{zone}/name") as f:
+            if f.read().strip() != name:
+                continue
+    except OSError:
+        continue
+    unmount(path)                           # a stale overlay from an earlier run would hide the real counter
+    real = os.open(path, os.O_RDONLY)       # kept open: after the bind mount this fd is the only way to the real file
+    with open(f"{BASE}/{zone}/max_energy_range_uj") as f:
+        wrap = int(f.read()) + 1
+    copy = f"{RUNDIR}/{zone}.energy_uj"
+    fd = os.open(copy, os.O_RDWR | os.O_CREAT, 0o444)   # same file (inode) across restarts, see unmount()
+    os.fchmod(fd, 0o444)
+    try:
+        total = int(os.pread(fd, 64, 0) or b"0")  # continue the published count, so a reader never sees it go back
+    except ValueError:
+        total = 0
+    zones.append({"path": path, "real": real, "wrap": wrap, "copy": copy, "fd": fd, "total": total})
+
+if not zones:
+    print("no RAPL package zone, nothing to do")
+    sys.exit(0)
 
 
-def publish(value: int) -> None:
-    os.pwrite(fd, b"%0*d\n" % (WIDTH, value), 0)
+def read_real(z) -> int:
+    return int(os.pread(z["real"], 64, 0))
 
 
-publish(total)
-subprocess.run(["mount", "--bind", COPY, REAL], check=True)
-last = read_real()
-print(f"overlay active: {REAL} -> world-readable copy, {PERIOD} s / {QUANTUM // 1000} mJ")
+def publish(z) -> None:
+    v = z["total"] - z["total"] % QUANTUM
+    os.pwrite(z["fd"], b"%0*d\n" % (WIDTH, v), 0)
+
+
+for z in zones:
+    publish(z)
+    subprocess.run(["mount", "--bind", z["copy"], z["path"]], check=True)
+    z["last"] = read_real(z)
+print(f"overlay active for {', '.join(z['path'] for z in zones)}: world-readable copies, {PERIOD} s / {QUANTUM // 1000} mJ")
 sys.stdout.flush()
 while True:
     time.sleep(PERIOD)
-    now = read_real()
-    total += now - last if now >= last else now + wrap - last
-    last = now
-    publish(total - total % QUANTUM)
+    for z in zones:
+        now = read_real(z)
+        z["total"] += now - z["last"] if now >= z["last"] else now + z["wrap"] - z["last"]
+        z["last"] = now
+        publish(z)
 EOT
 )
 
 RAPL_UNIT_CONTENT=$(cat <<'EOT'
 [Unit]
-Description=OXP3: coarse world-readable copy of the CPU package energy counter for the performance overlay
+Description=OXP3: coarse world-readable copies of the CPU package and GPU (PP1) energy counters for the performance overlay
 # see the header of __RAPL_PY__ ; revert: systemctl disable --now oxp3-rapl-overlay.service
 After=basic.target
 Before=display-manager.service
@@ -810,6 +836,40 @@ WantedBy=multi-user.target
 EOT
 )
 RAPL_UNIT_CONTENT="${RAPL_UNIT_CONTENT//__RAPL_PY__/$RAPL_PY}"
+
+MANGO_LAUNCH_CONTENT=$(cat <<'EOT'
+#!/bin/sh
+# Starts the OXP3 build of mangoapp (adds GPU power and temperature for the integrated xe GPU) through the systemd user
+# drop-in oxp3-mangoapp.conf. The stock /usr/bin/mangoapp starts instead when the binary is missing, cannot load its
+# libraries, was built for another mangohud version, or crashed three times within a minute, so the overlay never
+# depends on this build.
+B=__MANGO_BIN__
+STOCK=/usr/bin/mangoapp
+LOG="${XDG_RUNTIME_DIR:-/tmp}/oxp3-mangoapp.starts"
+now=$(date +%s)
+recent=$(awk -v n="$now" '$1 > n - 60' "$LOG" 2>/dev/null | wc -l)
+echo "$now" >> "$LOG"
+if [ "$recent" -lt 3 ] && [ -x "$B" ] && ! ldd "$B" 2>&1 | grep -q 'not found'; then
+    case "$(pacman -Q mangohud 2>/dev/null)" in
+        "mangohud __MANGO_FOR__-"*) exec "$B" "$@" ;;
+    esac
+fi
+echo "oxp3: patched mangoapp not used here (version, libraries or repeated crashes), starting the stock one" >&2
+exec "$STOCK" "$@"
+EOT
+)
+
+MANGO_DROPIN_CONTENT=$(cat <<'EOT'
+# OXP3: start mangoapp through a launcher that adds GPU power/temperature and falls back to the stock binary.
+# Revert: ./oxp3-apply-fixes.sh --revert (or rm this file, systemctl --user daemon-reload)
+[Service]
+ExecStart=
+ExecStart=__MANGO_LAUNCH__
+EOT
+)
+MANGO_LAUNCH_CONTENT="${MANGO_LAUNCH_CONTENT//__MANGO_BIN__/$MANGO_BIN}"
+MANGO_LAUNCH_CONTENT="${MANGO_LAUNCH_CONTENT//__MANGO_FOR__/$MANGO_FOR}"
+MANGO_DROPIN_CONTENT="${MANGO_DROPIN_CONTENT//__MANGO_LAUNCH__/$MANGO_LAUNCH}"
 
 # ---- experimental gyro (step 7) contents ------------------------------
 GRUB_IMU_CONTENT=$(cat <<'EOT'
@@ -957,6 +1017,11 @@ same_content() { # same_content <file> <content>  -> 0 if identical
 }
 CHANGED=0; NEED_REBOOT=0; NEED_RELOGIN=0; VOLKEY_RESTART=0; IP_RESTART=0; BATT_RESTART=0; TDP_RESTART=0; RAPL_RESTART=0
 have_rapl_pkg() { [ -e /sys/class/powercap/intel-rapl:0/energy_uj ]; }
+# the patched mangoapp is only useful for an integrated xe GPU without its own hwmon device
+igpu_without_hwmon() { [ "$(basename "$(readlink /sys/class/drm/card0/device/driver 2>/dev/null)")" = xe ] && ! ls -d /sys/class/drm/card0/device/hwmon >/dev/null 2>&1; }
+mango_bin_ok() { [ -f "$MANGO_BIN" ] && [ "$(sha256sum "$MANGO_BIN" | cut -d' ' -f1)" = "$MANGO_SHA256" ]; }
+mango_matches() { pacman -Q mangohud 2>/dev/null | grep -q "^mangohud $MANGO_FOR-"; }
+user_systemctl() { systemctl --user "$@" 2>/dev/null || true; }   # the desktop user's manager (the script runs as that user)
 have_rapl() { [ -r /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw ] && [ -r /sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw ]; }
 
 # ---- guards -----------------------------------------------------------
@@ -1093,6 +1158,10 @@ if have_rapl_pkg; then
     if findmnt -n -T /sys/class/powercap/intel-rapl:0/energy_uj -o SOURCE 2>/dev/null | grep -q oxp3-rapl; then RAPL_STATE="coarse copy published (overlay can read it)"; else RAPL_STATE="root-only (overlay shows no CPU power)"; fi
     say "  CPU power for the overlay : $RAPL_STATE"
 fi
+if igpu_without_hwmon; then
+    if [ -f "$MANGO_DROPIN" ] && mango_bin_ok; then MANGO_STATE="patched mangoapp installed$(mango_matches || echo ", but SteamOS has another mangohud version: the stock overlay runs")"; else MANGO_STATE="stock mangoapp (no GPU power/temperature)"; fi
+    say "  GPU power/temperature for the overlay : $MANGO_STATE"
+fi
 if [ "$GYRO_ON" = 1 ]; then
     say "  gyro (experimental) : enabled ; IMU $([ "$IMU_ACTIVE" = 1 ] && echo "visible to the kernel (ACPI override active)" || echo "NOT visible yet (ACPI override not loaded: reboot needed)") ; patched InputPlumber $(gyro_bin_ok && echo present || echo missing)"
 elif [ "$GYRO_WANT" = 1 ]; then
@@ -1161,6 +1230,12 @@ if [ "$MODE" = "--check" ]; then
         same_content "$RAPL_PY" "$RAPL_PY_CONTENT" || { say "  [diff] CPU power overlay script missing or differs"; ok=0; }
         same_content "$RAPL_UNIT" "$RAPL_UNIT_CONTENT" || { say "  [diff] CPU power overlay unit missing or differs"; ok=0; }
         systemctl is-enabled -q oxp3-rapl-overlay.service 2>/dev/null || { say "  [diff] oxp3-rapl-overlay.service not enabled"; ok=0; }
+    fi
+    if igpu_without_hwmon; then
+        mango_bin_ok || { say "  [diff] patched mangoapp missing or differs (apply takes it from the release archive)"; ok=0; }
+        same_content "$MANGO_LAUNCH" "$MANGO_LAUNCH_CONTENT" || { say "  [diff] mangoapp launcher missing or differs"; ok=0; }
+        same_content "$MANGO_DROPIN" "$MANGO_DROPIN_CONTENT" || { say "  [diff] mangoapp user drop-in missing or differs"; ok=0; }
+        mango_matches || say "  [info] SteamOS ships another mangohud than the patched build ($MANGO_FOR): the overlay uses the stock mangoapp"
     fi
     same_content "$IP_YAML" "$IP_YAML_CONTENT" || { say "  [diff] IP yaml missing or differs"; ok=0; }
     same_content "$IP_CAPMAP" "$IP_CAPMAP_CONTENT" || { say "  [diff] IP capability map missing or differs"; ok=0; }
@@ -1248,6 +1323,8 @@ if [ "$MODE" = "--revert" ]; then
     if [ -f "$TDP_SH" ]; then rm -f "$TDP_SH"; say "  removed $TDP_SH"; fi
     if [ -f "$RAPL_UNIT" ]; then sudo systemctl disable --now oxp3-rapl-overlay.service 2>/dev/null || true; sudo rm -f "$RAPL_UNIT"; sudo systemctl daemon-reload; say "  oxp3-rapl-overlay.service stopped and removed (CPU energy counter root-only again)"; fi
     if [ -f "$RAPL_PY" ]; then rm -f "$RAPL_PY"; say "  removed $RAPL_PY"; fi
+    if [ -f "$MANGO_DROPIN" ]; then sudo rm -f "$MANGO_DROPIN"; sudo rmdir "$(dirname "$MANGO_DROPIN")" 2>/dev/null || true; user_systemctl daemon-reload; say "  removed $MANGO_DROPIN (stock mangoapp from the next overlay start)"; fi
+    for _f in "$MANGO_LAUNCH" "$MANGO_BIN"; do [ -f "$_f" ] && { rm -f "$_f"; say "  removed $_f"; }; done
     if [ -f "$LUA_HDR" ]; then mv -f "$LUA_HDR" "$USER_HOME/oxp3-oled-hdr.lua.disabled"; say "  HDR lua moved to $USER_HOME/oxp3-oled-hdr.lua.disabled"; NEED_RELOGIN=1; fi
     if [ -f "$LUA_NOHDR_BAK" ] && [ ! -f "$LUA_NOHDR" ]; then mkdir -p "$LUA_DIR"; cp -f "$LUA_NOHDR_BAK" "$LUA_NOHDR"; say "  nohdr lua restored (prevents a black screen when HDR is on)"; NEED_RELOGIN=1; fi
     say "revert done. (The Wi-Fi firmware step is not undone: linux-firmware stays installed.)"
@@ -1297,7 +1374,8 @@ else
 fi
 say "   8) $TDP_SH + $TDP_UNIT (MSR package PL1 follows the MMIO PL1)   $(have_rapl && echo "[RAPL OK]" || echo "[SKIPPED: no MSR/MMIO package RAPL]")"
 say "   9) $SPLITLOCK_FILE (split_lock_detect=off) + update-grub, and remove the split-lock reports steamos-log-submitter queued   $(have_split_lock_detect && echo "[CPU has split-lock detection]" || echo "[SKIPPED: the CPU has no split-lock detection]")"
-say "  10) $RAPL_PY + $RAPL_UNIT (CPU power for the performance overlay, coarse copy of the energy counter)   $(have_rapl_pkg && echo "[RAPL OK]" || echo "[SKIPPED: no intel-rapl:0]")"
+say "  10) $RAPL_PY + $RAPL_UNIT (CPU/GPU energy for the performance overlay, coarse copies of the counters)   $(have_rapl_pkg && echo "[RAPL OK]" || echo "[SKIPPED: no intel-rapl:0]")"
+say "      + $MANGO_BIN + $MANGO_DROPIN (GPU power/temperature)   $(igpu_without_hwmon && echo "[integrated xe GPU]" || echo "[SKIPPED: the GPU has its own sensors]")"
 if [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then read -r -p "  Continue? (y/N) " _ans; case "$_ans" in y|Y) ;; *) say "  cancelled."; exit 0 ;; esac; fi
 sudo -v
 
@@ -1716,6 +1794,49 @@ if ! systemctl is-enabled -q oxp3-rapl-overlay.service 2>/dev/null; then
 fi
 if [ "$RAPL_RESTART" = 1 ] || ! systemctl is-active -q oxp3-rapl-overlay.service 2>/dev/null; then
     sudo systemctl restart oxp3-rapl-overlay.service && say "  [restart] oxp3-rapl-overlay.service (the overlay picks it up when it restarts, e.g. after re-entering game mode)"
+fi
+fi
+
+# e8. GPU power/temperature in the overlay: patched mangoapp started through a user drop-in (integrated xe GPU only)
+if ! igpu_without_hwmon; then
+    say "  [skip] the GPU has its own hwmon sensors, the stock overlay shows them"
+else
+MANGO_OK=1; MANGO_RESTART=0
+if mango_bin_ok; then
+    say "  [skip] $MANGO_BIN unchanged"
+elif [ -f "$SCRIPT_DIR/mangoapp-oxp3" ] && [ "$(sha256sum "$SCRIPT_DIR/mangoapp-oxp3" | cut -d' ' -f1)" = "$MANGO_SHA256" ]; then
+    install -m 755 "$SCRIPT_DIR/mangoapp-oxp3" "$MANGO_BIN"; say "  [write] $MANGO_BIN (from the release archive, sha256 verified)"; CHANGED=1; MANGO_RESTART=1
+elif ! command -v curl >/dev/null 2>&1 || ! ip route 2>/dev/null | grep -q '^default'; then
+    say "  [error] the patched mangoapp is not on this machine and there is no network to download it"; MANGO_OK=0
+else
+    say "  [run] downloading the release archive ($PKG_URL) ..."
+    _tmp="$(mktemp -d "${TMPDIR:-/tmp}/oxp3-pkg.XXXXXX")"
+    if curl -fL --retry 3 --progress-bar -o "$_tmp/pkg.tar.gz" "$PKG_URL" \
+        && tar -xzf "$_tmp/pkg.tar.gz" -C "$_tmp" oxp3-fix/mangoapp-oxp3 \
+        && [ "$(sha256sum "$_tmp/oxp3-fix/mangoapp-oxp3" | cut -d' ' -f1)" = "$MANGO_SHA256" ]; then
+        install -m 755 "$_tmp/oxp3-fix/mangoapp-oxp3" "$MANGO_BIN"; say "  [write] $MANGO_BIN (sha256 verified)"; CHANGED=1; MANGO_RESTART=1
+    else
+        say "  [error] download failed or the sha256 does not match"; MANGO_OK=0
+    fi
+    rm -rf "$_tmp"
+fi
+if [ "$MANGO_OK" = 1 ]; then
+    if same_content "$MANGO_LAUNCH" "$MANGO_LAUNCH_CONTENT"; then
+        say "  [skip] $MANGO_LAUNCH unchanged"
+    else
+        printf '%s\n' "$MANGO_LAUNCH_CONTENT" > "$MANGO_LAUNCH"; chmod +x "$MANGO_LAUNCH"
+        say "  [write] $MANGO_LAUNCH"; CHANGED=1; MANGO_RESTART=1
+    fi
+    if sudo_put "$MANGO_DROPIN" "$MANGO_DROPIN_CONTENT"; then CHANGED=1; MANGO_RESTART=1; fi
+    if [ "$MANGO_RESTART" = 1 ]; then
+        user_systemctl daemon-reload
+        if systemctl --user is-active -q gamescope-mangoapp.service 2>/dev/null; then
+            user_systemctl restart gamescope-mangoapp.service; say "  [restart] the performance overlay (mangoapp)"
+        else
+            say "  the overlay uses the patched build from the next game-mode session"
+        fi
+    fi
+    mango_matches || say "  [info] SteamOS ships another mangohud than the patched build ($MANGO_FOR): the launcher starts the stock mangoapp until a matching build is released"
 fi
 fi
 
