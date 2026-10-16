@@ -29,7 +29,7 @@ for z in imgui_1.91.6-3_patch.zip spdlog-1.14.1-1-wrap.zip vulkan-headers-1.3.28
 cd /w/MangoHud/subprojects && ln -sfn /w/src/imgui-1.91.6 . && ln -sfn /w/src/spdlog-1.14.1 . && ln -sfn /w/src/implot-0.16 . && ln -sfn /w/src/Vulkan-Headers-1.3.283 .
 source /etc/makepkg.conf
 export CFLAGS CXXFLAGS LDFLAGS
-cd /w/MangoHud && rm -rf /w/b && meson setup /w/b --prefix=/usr --libexecdir=lib --buildtype=plain --wrap-mode=nodownload -D b_ndebug=true -D append_libdir_mangohud=false -D use_system_spdlog=disabled -D mangoapp=true -D mangohudctl=false -D with_xnvctrl=disabled -D tests=disabled >/w/meson.log 2>&1
+cd /w/MangoHud && rm -rf /w/b && meson setup /w/b --prefix=/usr --libexecdir=lib --buildtype=plain --wrap-mode=nodownload -D append_libdir_mangohud=false -D use_system_spdlog=disabled -D mangoapp=true -D mangohudctl=false -D with_xnvctrl=disabled -D tests=disabled >/w/meson.log 2>&1
 meson compile -C /w/b mangoapp 2>&1 | tail -3
 strip /w/b/src/mangoapp
 ls -l /w/b/src/mangoapp
