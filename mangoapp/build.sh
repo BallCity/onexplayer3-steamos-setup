@@ -30,7 +30,7 @@ cd /w/MangoHud/subprojects && ln -sfn /w/src/imgui-1.91.6 . && ln -sfn /w/src/sp
 source /etc/makepkg.conf
 export CFLAGS CXXFLAGS LDFLAGS
 cd /w/MangoHud && rm -rf /w/b && meson setup /w/b --prefix=/usr --libexecdir=lib --buildtype=plain --wrap-mode=nodownload -D append_libdir_mangohud=false -D use_system_spdlog=disabled -D mangoapp=true -D mangohudctl=false -D with_xnvctrl=disabled -D tests=disabled >/w/meson.log 2>&1
-meson compile -C /w/b mangoapp 2>&1 | tail -3
+meson compile -C /w/b mangoapp 2>&1 | tail -40
 strip /w/b/src/mangoapp
 ls -l /w/b/src/mangoapp
 "
