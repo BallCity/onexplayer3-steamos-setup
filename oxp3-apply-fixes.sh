@@ -1,12 +1,20 @@
 #!/bin/bash
 # oxp3-steamos-fixes - ONEXPLAYER 3 (Intel Panther Lake) SteamOS fix pack
-# Version: 20261015     License: MIT (see LICENSE)     Author: HANA & Claude
+# Version: 20261016     License: MIT (see LICENSE)     Author: HANA & Claude
 # Tested on: SteamOS 3.10 main build 20260827.1000, kernel 7.2.0-valve1-1-neptune-72, OXP3 BIOS 5.09,
 #            panel Samsung SDC AMS881KB01-0, SSD Predator GM7 1TB (Biwin/Maxio 1dee:1602)
 # v1.1.0: gamescope HDR lua now also registers real 30-144Hz dynamic_modegen (this panel has genuine
 #         continuous VRR; the v1.0.1 lua declared dynamic_refresh_rates but never shipped the
 #         matching dynamic_modegen function, so no extra Hz options ever actually appeared in the
 #         Steam Performance panel's per-game refresh-rate selector).
+# 20261016: new step 10, CPU and GPU power/temperature in the performance overlay: a root service publishes coarse
+#         (0.5 s, 10 mJ) world-readable copies of the package and PP1 energy counters, and a patched mangoapp (binary in the
+#         release archive, sha256 pinned, falls back to the stock one) reads GPU power from PP1 and the GPU temperature
+#         from the package sensor. This replaces the opt-in udev rule of 20261015, which made the raw counter world-readable.
+#         New step 11, DMC v2.20 pin: SteamOS 20261015.1000 ships DMC v2.36, which caps VRR at 70-80 fps (issue #1).
+#         New step 12, speaker route check: after a boot or resume the jack detection can leave PipeWire on the
+#         Headphones profile with the speakers switched off; a user unit selects the Speaker profile when the jack is empty.
+#         Sysfs overlays (battery clamp, RAPL copies) are detached lazily, so restarts no longer stack mounts.
 # 20261015: new step 9, split-lock flood (contributed by kas5852, PR #16). Panther Lake traps user-space split locks and
 #         Steam causes them continuously; steamos-manager logs every one and steamos-log-submitter queues one report file
 #         per hit (seen: 119,091 files / 479 MB on BIOS 5.09, 361,102 on 5.12), which also pushed everything else out of the
@@ -51,7 +59,7 @@
 #         the hid-oxp sysfs (driver pages 1-2 only, never raw hidraw); new --mcu-restore (DANGEROUS, explicit, confirmed)
 #         rewrites MCU button-table page 3 (Home 0x24 + factory-default 0x21/0x25-0x2B) to recover a Home/Xbox
 #         key that went silent after a foreign tool overwrote the MCU table.
-OXP3_FIXES_VERSION="20261015"
+OXP3_FIXES_VERSION="20261016"
 TESTED_STEAMOS_BUILD="20260827.1000"
 TESTED_KERNEL_PREFIX="7.2.0-valve1"
 # ============================================================================
